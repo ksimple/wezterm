@@ -787,6 +787,16 @@ impl super::TermWindow {
 
         pane.apply_hyperlinks(stable_row..stable_row + 1, &self.config.hyperlink_rules);
 
+        // If typing just hid the mouse cursor, ignore same-coordinate Move
+        // events for both cursor restoration and hyperlink hover state.  On
+        // Windows those can arrive without the user moving the mouse and would
+        // otherwise immediately restore MouseCursor::Text and/or resurrect the
+        // clickable hyperlink underline.
+        let current_mouse_coords = (event.coords.x as i64, event.coords.y as i64);
+        let same_coord_move_hidden_by_typing = self.mouse_cursor_hidden_by_typing
+            && matches!(&event.kind, WMEK::Move)
+            && self.mouse_cursor_hidden_at == Some(current_mouse_coords);
+
         struct FindCurrentLink {
             current: Option<Arc<Hyperlink>>,
             stable_row: StableRowIndex,
@@ -811,7 +821,11 @@ impl super::TermWindow {
             column,
         };
         pane.with_lines_mut(stable_row..stable_row + 1, &mut find_link);
-        let new_highlight = find_link.current;
+        let new_highlight = if same_coord_move_hidden_by_typing {
+            None
+        } else {
+            find_link.current
+        };
 
         match (self.current_highlight.as_ref(), new_highlight) {
             (Some(old_link), Some(new_link)) if Arc::ptr_eq(&old_link, &new_link) => {
@@ -843,15 +857,7 @@ impl super::TermWindow {
             MouseCursor::Text
         };
 
-        // HIDE_MOUSE_CURSOR_WHEN_TYPING_SAME_COORD_FIX:
-        // If typing just hid the mouse cursor, ignore same-coordinate Move
-        // events. On Windows those can arrive without the user moving the
-        // mouse and would otherwise immediately restore MouseCursor::Text.
-        let current_mouse_coords = (event.coords.x as i64, event.coords.y as i64);
-        let should_set_mouse_cursor = if self.mouse_cursor_hidden_by_typing
-            && matches!(&event.kind, WMEK::Move)
-            && self.mouse_cursor_hidden_at == Some(current_mouse_coords)
-        {
+        let should_set_mouse_cursor = if same_coord_move_hidden_by_typing {
             false
         } else {
             if self.mouse_cursor_hidden_by_typing {

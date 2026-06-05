@@ -417,6 +417,7 @@ impl super::TermWindow {
                                 (event.coords.x as i64, event.coords.y as i64)
                             });
                             context.set_cursor(None);
+                            self.current_highlight.take();
                         }
                         if !keycode.is_modifier() {
                             context.invalidate();
@@ -722,6 +723,7 @@ impl super::TermWindow {
                             (event.coords.x as i64, event.coords.y as i64)
                         });
                         context.set_cursor(None);
+                        self.current_highlight.take();
                     }
                     if !key.is_modifier() {
                         context.invalidate();
