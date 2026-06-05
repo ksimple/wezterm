@@ -833,7 +833,7 @@ impl super::TermWindow {
             || event.coords.y < 0
             || event.coords.y as usize > self.dimensions.pixel_height;
 
-        context.set_cursor(Some(if self.current_highlight.is_some() {
+        let mouse_cursor = if self.current_highlight.is_some() {
             // When hovering over a hyperlink, show an appropriate
             // mouse cursor to give the cue that it is clickable
             MouseCursor::Hand
@@ -841,7 +841,29 @@ impl super::TermWindow {
             MouseCursor::Arrow
         } else {
             MouseCursor::Text
-        }));
+        };
+
+        // HIDE_MOUSE_CURSOR_WHEN_TYPING_SAME_COORD_FIX:
+        // If typing just hid the mouse cursor, ignore same-coordinate Move
+        // events. On Windows those can arrive without the user moving the
+        // mouse and would otherwise immediately restore MouseCursor::Text.
+        let current_mouse_coords = (event.coords.x as i64, event.coords.y as i64);
+        let should_set_mouse_cursor = if self.mouse_cursor_hidden_by_typing
+            && matches!(&event.kind, WMEK::Move)
+            && self.mouse_cursor_hidden_at == Some(current_mouse_coords)
+        {
+            false
+        } else {
+            if self.mouse_cursor_hidden_by_typing {
+                self.mouse_cursor_hidden_by_typing = false;
+                self.mouse_cursor_hidden_at = None;
+            }
+            true
+        };
+
+        if should_set_mouse_cursor {
+            context.set_cursor(Some(mouse_cursor));
+        }
 
         let event_trigger_type = match &event.kind {
             WMEK::Press(press) => {

@@ -412,6 +412,10 @@ impl super::TermWindow {
                             && self.config.hide_mouse_cursor_when_typing
                             && !keycode.is_modifier()
                         {
+                            self.mouse_cursor_hidden_by_typing = true;
+                            self.mouse_cursor_hidden_at = self.current_mouse_event.as_ref().map(|event| {
+                                (event.coords.x as i64, event.coords.y as i64)
+                            });
                             context.set_cursor(None);
                         }
                         if !keycode.is_modifier() {
@@ -713,6 +717,10 @@ impl super::TermWindow {
                         && self.config.hide_mouse_cursor_when_typing
                         && !key.is_modifier()
                     {
+                        self.mouse_cursor_hidden_by_typing = true;
+                        self.mouse_cursor_hidden_at = self.current_mouse_event.as_ref().map(|event| {
+                            (event.coords.x as i64, event.coords.y as i64)
+                        });
                         context.set_cursor(None);
                     }
                     if !key.is_modifier() {
