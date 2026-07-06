@@ -12,6 +12,7 @@ use std::rc::Rc;
 use termwiz::cell::{AttributeChange, CellAttributes};
 use termwiz::color::ColorAttribute;
 use termwiz::input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent};
+use termwiz::lineedit::{LineEditBuffer, Movement};
 use termwiz::surface::{Change, Position};
 use termwiz::terminal::Terminal;
 use termwiz_funcs::truncate_right;
@@ -310,6 +311,22 @@ impl SelectorState {
                 }) => {
                     self.trigger_event(None);
                     break;
+                }
+                InputEvent::Key(KeyEvent {
+                    key: KeyCode::Char('W'),
+                    modifiers: Modifiers::CTRL,
+                }) if self.filtering => {
+                    let mut buffer = LineEditBuffer::new(&self.filter_term, self.filter_term.len());
+                    buffer.kill_text(Movement::BackwardWord(1), Movement::BackwardWord(1));
+                    self.filter_term = buffer.get_line().to_string();
+                    self.update_filter();
+                }
+                InputEvent::Key(KeyEvent {
+                    key: KeyCode::Char('U'),
+                    modifiers: Modifiers::CTRL,
+                }) if self.filtering => {
+                    self.filter_term.clear();
+                    self.update_filter();
                 }
                 InputEvent::Key(KeyEvent {
                     key: KeyCode::Char(c),
