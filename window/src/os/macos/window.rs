@@ -1407,6 +1407,7 @@ fn apply_decorations_to_window(
         }
 
         if let Some(titlebar_view_container) = get_titlebar_view_container(window) {
+            // hiding the subview prevents it from participating in normal visible/hit-tested view behavior
             let _: () = msg_send![*titlebar_view_container.load(), setHidden: hidden];
         }
 
