@@ -12,6 +12,7 @@ use std::rc::Rc;
 use termwiz::cell::{AttributeChange, CellAttributes};
 use termwiz::color::ColorAttribute;
 use termwiz::input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent};
+use termwiz::lineedit::{LineEditBuffer, Movement};
 use termwiz::surface::{Change, Position};
 use termwiz::terminal::Terminal;
 use termwiz_funcs::truncate_right;
@@ -54,6 +55,13 @@ struct SelectorState {
 }
 
 impl SelectorState {
+    fn kill_filter_text(&mut self, movement: Movement) {
+        let mut buffer = LineEditBuffer::new(&self.filter_term, self.filter_term.len());
+        buffer.kill_text(movement, movement);
+        self.filter_term = buffer.get_line().to_string();
+        self.update_filter();
+    }
+
     fn update_filter(&mut self) {
         if self.filter_term.is_empty() {
             self.filtered_entries = self.args.choices.clone();
@@ -312,8 +320,24 @@ impl SelectorState {
                     break;
                 }
                 InputEvent::Key(KeyEvent {
+                    key: KeyCode::Char('W'),
+                    modifiers: Modifiers::CTRL,
+                }) if self.filtering => {
+                    self.kill_filter_text(Movement::BackwardWord(1));
+                }
+                InputEvent::Key(KeyEvent {
+                    key: KeyCode::Char('U'),
+                    modifiers: Modifiers::CTRL,
+                }) if self.filtering => {
+                    self.kill_filter_text(Movement::StartOfLine);
+                }
+                InputEvent::Key(KeyEvent {
                     key: KeyCode::Char(c),
-                    ..
+                    modifiers: Modifiers::NONE,
+                })
+                | InputEvent::Key(KeyEvent {
+                    key: KeyCode::Char(c),
+                    modifiers: Modifiers::SHIFT,
                 }) if self.filtering => {
                     self.filter_term.push(c);
                     self.update_filter();
