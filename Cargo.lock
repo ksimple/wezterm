@@ -7118,6 +7118,7 @@ dependencies = [
  "hdrhistogram",
  "http_req",
  "image",
+ "image-webp",
  "k9",
  "lazy_static",
  "lfucache",
