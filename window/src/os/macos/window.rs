@@ -1365,6 +1365,11 @@ fn effective_decorations(
     decorations
 }
 
+fn titlebar_is_hidden(decorations: WindowDecorations) -> bool {
+    !decorations.contains(WindowDecorations::TITLE)
+        && !decorations.contains(WindowDecorations::INTEGRATED_BUTTONS)
+}
+
 fn apply_decorations_to_window(
     window: &StrongPtr,
     decorations: WindowDecorations,
@@ -1375,13 +1380,8 @@ fn apply_decorations_to_window(
     unsafe {
         window.setStyleMask_(mask);
 
-        let hidden = if decorations.contains(WindowDecorations::TITLE)
-            || decorations.contains(WindowDecorations::INTEGRATED_BUTTONS)
-        {
-            NO
-        } else {
-            YES
-        };
+        let is_hidden = titlebar_is_hidden(decorations);
+        let hidden: BOOL = if is_hidden { YES } else { NO };
 
         for titlebar_button in &[
             appkit::NSWindowButton::NSWindowMiniaturizeButton,
@@ -1405,6 +1405,37 @@ fn apply_decorations_to_window(
         } else {
             window.setTitlebarAppearsTransparent_(hidden);
         }
+
+        if let Some(titlebar_view_container) = get_titlebar_view_container(window) {
+            // hiding the subview prevents it from participating in normal visible/hit-tested view behavior
+            let _: () = msg_send![*titlebar_view_container.load(), setHidden: hidden];
+        }
+
+        let movable: BOOL = if is_hidden { NO } else { YES };
+        let () = msg_send![**window, setMovable: movable];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn titlebar_hidden_for_no_title_and_no_integrated_buttons() {
+        assert!(titlebar_is_hidden(WindowDecorations::NONE));
+        assert!(titlebar_is_hidden(WindowDecorations::RESIZE));
+    }
+
+    #[test]
+    fn titlebar_visible_when_title_or_integrated_buttons_present() {
+        assert!(!titlebar_is_hidden(WindowDecorations::TITLE));
+        assert!(!titlebar_is_hidden(
+            WindowDecorations::TITLE | WindowDecorations::RESIZE
+        ));
+        assert!(!titlebar_is_hidden(WindowDecorations::INTEGRATED_BUTTONS));
+        assert!(!titlebar_is_hidden(
+            WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE
+        ));
     }
 }
 
