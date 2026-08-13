@@ -257,7 +257,7 @@ mod win {
 
         pub fn reset_outer_input_modes(&mut self) -> anyhow::Result<()> {
             self.write_all(
-                b"\x1b[?9001l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l",
+                b"\x1b[?1l\x1b[?9001l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l",
             )
         }
 
@@ -294,6 +294,7 @@ mod win {
         pub fn input_reader(&self) -> anyhow::Result<WinInputReader> {
             Ok(WinInputReader {
                 read: self.read.try_clone()?,
+                write: self.write.try_clone()?,
             })
         }
 
@@ -310,9 +311,36 @@ mod win {
 
     pub struct WinInputReader {
         read: FileDescriptor,
+        write: FileDescriptor,
     }
 
     impl WinInputReader {
+        pub fn get_size(&self) -> anyhow::Result<PtySize> {
+            let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+            let ok = unsafe {
+                GetConsoleScreenBufferInfo(
+                    self.write.as_raw_handle() as *mut _,
+                    &mut info as *mut _,
+                )
+            };
+            if ok == 0 {
+                anyhow::bail!(
+                    "GetConsoleScreenBufferInfo failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            let cols = 1 + (info.srWindow.Right - info.srWindow.Left);
+            let rows = 1 + (info.srWindow.Bottom - info.srWindow.Top);
+
+            Ok(PtySize {
+                rows: rows as u16,
+                cols: cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+        }
+
         pub fn read_console_input(
             &mut self,
             num_events: usize,
@@ -456,6 +484,7 @@ enum MouseTrackingMode {
 #[cfg(windows)]
 #[derive(Debug, Clone)]
 struct InnerInputState {
+    application_cursor_keys: bool,
     mouse_default: bool,
     mouse_button_event: bool,
     mouse_any_event: bool,
@@ -470,6 +499,7 @@ struct InnerInputState {
 impl Default for InnerInputState {
     fn default() -> Self {
         Self {
+            application_cursor_keys: false,
             mouse_default: false,
             mouse_button_event: false,
             mouse_any_event: false,
@@ -486,6 +516,7 @@ impl Default for InnerInputState {
 impl InnerInputState {
     fn set_mode(&mut self, mode: u16, enabled: bool) {
         match mode {
+            1 => self.application_cursor_keys = enabled,
             1000 => self.mouse_default = enabled,
             1002 => self.mouse_button_event = enabled,
             1003 => self.mouse_any_event = enabled,
@@ -515,9 +546,6 @@ struct InputModeTracker {
 
 #[cfg(windows)]
 impl InputModeTracker {
-    // TODO: Track DECCKM (?1h/l) for application cursor keys, and eventually
-    // filter input-mode sequences from child output so record owns the outer
-    // terminal's win32-input/mouse/paste/focus state instead of only observing it.
     fn new(state: Arc<Mutex<InnerInputState>>) -> Self {
         Self {
             state,
@@ -525,13 +553,15 @@ impl InputModeTracker {
         }
     }
 
-    fn observe(&mut self, bytes: &[u8]) {
+    fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut data = std::mem::take(&mut self.pending);
         data.extend_from_slice(bytes);
+        let mut output = Vec::with_capacity(data.len());
 
         let mut i = 0;
         while i < data.len() {
             if data[i] != 0x1b {
+                output.push(data[i]);
                 i += 1;
                 continue;
             }
@@ -542,6 +572,7 @@ impl InputModeTracker {
             }
 
             if data[i + 1] != b'[' || data[i + 2] != b'?' {
+                output.push(data[i]);
                 i += 1;
                 continue;
             }
@@ -559,19 +590,48 @@ impl InputModeTracker {
             let final_byte = data[end];
             if final_byte == b'h' || final_byte == b'l' {
                 let enabled = final_byte == b'h';
-                if let Ok(params) = std::str::from_utf8(&data[i + 3..end]) {
-                    if let Ok(mut state) = self.state.lock() {
-                        for param in params.split(';') {
-                            if let Ok(mode) = param.parse::<u16>() {
+                match Self::split_dec_private_modes(&data[i + 3..end]) {
+                    Some((owned_modes, passthrough_modes)) if !owned_modes.is_empty() => {
+                        if let Ok(mut state) = self.state.lock() {
+                            for mode in owned_modes {
                                 state.set_mode(mode, enabled);
                             }
                         }
+                        if !passthrough_modes.is_empty() {
+                            output.extend_from_slice(b"\x1b[?");
+                            output.extend_from_slice(passthrough_modes.join(";").as_bytes());
+                            output.push(final_byte);
+                        }
                     }
+                    _ => output.extend_from_slice(&data[i..=end]),
                 }
+            } else {
+                output.extend_from_slice(&data[i..=end]);
             }
 
             i = end + 1;
         }
+
+        output
+    }
+
+    fn split_dec_private_modes(params: &[u8]) -> Option<(Vec<u16>, Vec<String>)> {
+        let params = std::str::from_utf8(params).ok()?;
+        let mut owned_modes = Vec::new();
+        let mut passthrough_modes = Vec::new();
+
+        for param in params.split(';') {
+            match param.parse::<u16>() {
+                Ok(mode) if Self::owns_dec_private_mode(mode) => owned_modes.push(mode),
+                Ok(_) | Err(_) => passthrough_modes.push(param.to_string()),
+            }
+        }
+
+        Some((owned_modes, passthrough_modes))
+    }
+
+    fn owns_dec_private_mode(mode: u16) -> bool {
+        matches!(mode, 1 | 1000 | 1002 | 1003 | 1004 | 1006 | 2004 | 9001)
     }
 }
 
@@ -583,8 +643,6 @@ struct WinInputEncoder {
 
 #[cfg(windows)]
 impl WinInputEncoder {
-    // TODO: Add legacy mouse, horizontal wheel, focus-event, and explicit paste
-    // boundary handling once the main keyboard/mouse bridge semantics are stable.
     fn encode_records(
         &mut self,
         parser: &mut termwiz::input::InputParser,
@@ -620,7 +678,17 @@ impl WinInputEncoder {
                     if let Some(mouse) =
                         self.encode_mouse(unsafe { record.Event.MouseEvent() }, state)
                     {
-                        output.extend_from_slice(mouse.as_bytes());
+                        output.extend_from_slice(&mouse);
+                    }
+                }
+                FOCUS_EVENT => {
+                    if state.focus {
+                        let focus = unsafe { record.Event.FocusEvent() };
+                        output.extend_from_slice(if focus.bSetFocus != 0 {
+                            b"\x1b[I"
+                        } else {
+                            b"\x1b[O"
+                        });
                     }
                 }
                 _ => {}
@@ -640,7 +708,7 @@ impl WinInputEncoder {
 
         let modes = KeyCodeEncodeModes {
             encoding: KeyboardEncoding::Xterm,
-            application_cursor_keys: false,
+            application_cursor_keys: state.application_cursor_keys,
             newline_mode: false,
             modify_other_keys: None,
         };
@@ -686,16 +754,17 @@ impl WinInputEncoder {
         &mut self,
         mouse: &winapi::um::wincon::MOUSE_EVENT_RECORD,
         state: &InnerInputState,
-    ) -> Option<String> {
+    ) -> Option<Vec<u8>> {
         use winapi::um::wincon::*;
 
-        if state.mouse_tracking == MouseTrackingMode::None || !state.sgr_mouse {
+        if state.mouse_tracking == MouseTrackingMode::None {
             self.last_mouse_buttons = mouse.dwButtonState;
             return None;
         }
 
         let is_move = (mouse.dwEventFlags & MOUSE_MOVED) != 0;
         let is_wheel = (mouse.dwEventFlags & MOUSE_WHEELED) != 0;
+        let is_horizontal_wheel = (mouse.dwEventFlags & MOUSE_HWHEELED) != 0;
         let physical_button_pressed = mouse.dwButtonState
             & (FROM_LEFT_1ST_BUTTON_PRESSED
                 | FROM_LEFT_2ND_BUTTON_PRESSED
@@ -721,6 +790,13 @@ impl WinInputEncoder {
             } else {
                 65
             }
+        } else if is_horizontal_wheel {
+            let delta = ((mouse.dwButtonState >> 16) & 0xffff) as i16;
+            if delta > 0 {
+                66
+            } else {
+                67
+            }
         } else if is_move && !physical_button_pressed {
             3
         } else {
@@ -740,30 +816,204 @@ impl WinInputEncoder {
             }
         };
 
+        let mut modifier_code = 0;
         if is_move {
-            code += 32;
+            modifier_code += 32;
         }
         if (mouse.dwControlKeyState & SHIFT_PRESSED) != 0 {
-            code += 4;
+            modifier_code += 4;
         }
         if (mouse.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0 {
-            code += 8;
+            modifier_code += 8;
         }
         if (mouse.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0 {
-            code += 16;
+            modifier_code += 16;
         }
+        code += modifier_code;
 
-        let is_release =
-            !is_move && !is_wheel && mouse.dwButtonState == 0 && self.last_mouse_buttons != 0;
+        let is_release = !is_move
+            && !is_wheel
+            && !is_horizontal_wheel
+            && mouse.dwButtonState == 0
+            && self.last_mouse_buttons != 0;
         self.last_mouse_buttons = mouse.dwButtonState;
 
-        Some(format!(
-            "\x1b[<{};{};{}{}",
-            code,
-            mouse.dwMousePosition.X + 1,
-            mouse.dwMousePosition.Y + 1,
-            if is_release { 'm' } else { 'M' }
-        ))
+        if state.sgr_mouse {
+            Some(
+                format!(
+                    "\x1b[<{};{};{}{}",
+                    code,
+                    mouse.dwMousePosition.X + 1,
+                    mouse.dwMousePosition.Y + 1,
+                    if is_release { 'm' } else { 'M' }
+                )
+                .into_bytes(),
+            )
+        } else {
+            let code = if is_release { 3 + modifier_code } else { code };
+            let col = i32::from(mouse.dwMousePosition.X) + 1;
+            let row = i32::from(mouse.dwMousePosition.Y) + 1;
+            if !(1..=223).contains(&col) || !(1..=223).contains(&row) {
+                return None;
+            }
+            Some(vec![
+                0x1b,
+                b'[',
+                b'M',
+                (32 + code) as u8,
+                (32 + col) as u8,
+                (32 + row) as u8,
+            ])
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_input_bridge_tests {
+    use super::*;
+    use winapi::shared::minwindef::TRUE;
+    use winapi::um::wincon::*;
+
+    fn tracker() -> (Arc<Mutex<InnerInputState>>, InputModeTracker) {
+        let state = Arc::new(Mutex::new(InnerInputState::default()));
+        let tracker = InputModeTracker::new(Arc::clone(&state));
+        (state, tracker)
+    }
+
+    fn mouse_record(
+        x: i16,
+        y: i16,
+        button_state: u32,
+        control_state: u32,
+        flags: u32,
+    ) -> MOUSE_EVENT_RECORD {
+        MOUSE_EVENT_RECORD {
+            dwMousePosition: COORD { X: x, Y: y },
+            dwButtonState: button_state,
+            dwControlKeyState: control_state,
+            dwEventFlags: flags,
+        }
+    }
+
+    #[test]
+    fn filters_owned_input_modes_and_updates_state() {
+        let (state, mut tracker) = tracker();
+
+        let output = tracker.filter(b"before\x1b[?9001h\x1b[?1000;1006;2004hafter");
+
+        assert_eq!(output, b"beforeafter");
+        let state = state.lock().unwrap();
+        assert!(state.win32_input);
+        assert_eq!(state.mouse_tracking, MouseTrackingMode::Default);
+        assert!(state.sgr_mouse);
+        assert!(state.bracketed_paste);
+    }
+
+    #[test]
+    fn preserves_unowned_dec_private_modes_from_mixed_sequence() {
+        let (state, mut tracker) = tracker();
+
+        let output = tracker.filter(b"\x1b[?25;1000h");
+
+        assert_eq!(output, b"\x1b[?25h");
+        assert_eq!(
+            state.lock().unwrap().mouse_tracking,
+            MouseTrackingMode::Default
+        );
+    }
+
+    #[test]
+    fn filters_fragmented_input_mode_sequence() {
+        let (state, mut tracker) = tracker();
+
+        assert_eq!(tracker.filter(b"a\x1b[?10"), b"a");
+        assert_eq!(tracker.filter(b"04hB"), b"B");
+
+        assert!(state.lock().unwrap().focus);
+    }
+
+    #[test]
+    fn tracks_application_cursor_mode() {
+        let (state, mut tracker) = tracker();
+
+        assert_eq!(tracker.filter(b"\x1b[?1h"), b"");
+        assert!(state.lock().unwrap().application_cursor_keys);
+        assert_eq!(tracker.filter(b"\x1b[?1l"), b"");
+        assert!(!state.lock().unwrap().application_cursor_keys);
+    }
+
+    #[test]
+    fn encodes_sgr_horizontal_mouse_wheel() {
+        let mut encoder = WinInputEncoder::default();
+        let state = InnerInputState {
+            mouse_any_event: true,
+            mouse_tracking: MouseTrackingMode::AnyEvent,
+            sgr_mouse: true,
+            ..Default::default()
+        };
+        let mouse = mouse_record(41, 11, 120u32 << 16, 0, MOUSE_HWHEELED);
+
+        assert_eq!(
+            encoder.encode_mouse(&mouse, &state).unwrap(),
+            b"\x1b[<66;42;12M"
+        );
+    }
+
+    #[test]
+    fn encodes_legacy_mouse_when_sgr_is_not_enabled() {
+        let mut encoder = WinInputEncoder::default();
+        let state = InnerInputState {
+            mouse_default: true,
+            mouse_tracking: MouseTrackingMode::Default,
+            sgr_mouse: false,
+            ..Default::default()
+        };
+        let mouse = mouse_record(0, 0, FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0);
+
+        assert_eq!(
+            encoder.encode_mouse(&mouse, &state).unwrap(),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+    }
+
+    #[test]
+    fn encodes_legacy_mouse_release_as_button_three() {
+        let mut encoder = WinInputEncoder::default();
+        encoder.last_mouse_buttons = FROM_LEFT_1ST_BUTTON_PRESSED;
+        let state = InnerInputState {
+            mouse_default: true,
+            mouse_tracking: MouseTrackingMode::Default,
+            sgr_mouse: false,
+            ..Default::default()
+        };
+        let mouse = mouse_record(0, 0, 0, 0, 0);
+
+        assert_eq!(
+            encoder.encode_mouse(&mouse, &state).unwrap(),
+            vec![0x1b, b'[', b'M', 35, 33, 33]
+        );
+    }
+
+    #[test]
+    fn encodes_focus_events_when_enabled() {
+        let state = InnerInputState {
+            focus: true,
+            ..Default::default()
+        };
+        let mut focus: FOCUS_EVENT_RECORD = unsafe { std::mem::zeroed() };
+        focus.bSetFocus = TRUE;
+        let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+        record.EventType = FOCUS_EVENT;
+        unsafe {
+            *record.Event.FocusEvent_mut() = focus;
+        }
+        let mut encoder = WinInputEncoder::default();
+        let mut parser = termwiz::input::InputParser::new();
+
+        assert_eq!(
+            encoder.encode_records(&mut parser, &[record], &state),
+            b"\x1b[I"
+        );
     }
 }
 
@@ -903,15 +1153,7 @@ impl RecordCommand {
                     let records = input.read_console_input(128)?;
                     for record in &records {
                         if record.EventType == winapi::um::wincon::WINDOW_BUFFER_SIZE_EVENT {
-                            // TODO: Re-read CONOUT$ screen buffer info here so resize uses
-                            // viewport dimensions rather than the console buffer size.
-                            let size = unsafe { record.Event.WindowBufferSizeEvent() };
-                            tx.send(Message::Resize(PtySize {
-                                rows: size.dwSize.Y as u16,
-                                cols: size.dwSize.X as u16,
-                                pixel_width: 0,
-                                pixel_height: 0,
-                            }))?;
+                            tx.send(Message::Resize(input.get_size()?))?;
                         }
                     }
                     let state = state.lock().map(|state| state.clone()).unwrap_or_default();
@@ -980,7 +1222,10 @@ impl RecordCommand {
                     let elapsed = first_output.elapsed().as_secs_f32();
                     #[cfg(windows)]
                     if let Some(tracker) = input_mode_tracker.as_mut() {
-                        tracker.observe(&data);
+                        data = tracker.filter(&data);
+                    }
+                    if data.is_empty() {
+                        continue;
                     }
                     tty.write_all(&data)?;
 
