@@ -144,6 +144,13 @@ mod win {
     use winapi::um::wincon::*;
     use winapi::um::winnls::CP_UTF8;
 
+    fn check_bool(ok: i32, context: &str) -> anyhow::Result<()> {
+        if ok == 0 {
+            anyhow::bail!("{context}: {}", std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub struct WinTty {
         saved_input: u32,
         saved_output: u32,
@@ -163,10 +170,16 @@ mod win {
             let mut saved_output = 0;
             let saved_cp;
             unsafe {
-                GetConsoleMode(read.as_raw_file_descriptor() as *mut _, &mut saved_input);
-                GetConsoleMode(write.as_raw_file_descriptor() as *mut _, &mut saved_output);
+                check_bool(
+                    GetConsoleMode(read.as_raw_file_descriptor() as *mut _, &mut saved_input),
+                    "GetConsoleMode(CONIN$) failed",
+                )?;
+                check_bool(
+                    GetConsoleMode(write.as_raw_file_descriptor() as *mut _, &mut saved_output),
+                    "GetConsoleMode(CONOUT$) failed",
+                )?;
                 saved_cp = GetConsoleOutputCP();
-                SetConsoleOutputCP(CP_UTF8);
+                check_bool(SetConsoleOutputCP(CP_UTF8), "SetConsoleOutputCP failed")?;
             }
 
             Ok(Self {
@@ -180,43 +193,64 @@ mod win {
 
         pub fn set_cooked(&mut self) -> anyhow::Result<()> {
             unsafe {
-                SetConsoleOutputCP(self.saved_cp);
-                SetConsoleMode(self.read.as_raw_handle() as *mut _, self.saved_input);
-                SetConsoleMode(self.write.as_raw_handle() as *mut _, self.saved_output);
+                check_bool(
+                    SetConsoleOutputCP(self.saved_cp),
+                    "SetConsoleOutputCP failed",
+                )?;
+                check_bool(
+                    SetConsoleMode(self.read.as_raw_handle() as *mut _, self.saved_input),
+                    "SetConsoleMode(CONIN$ restore) failed",
+                )?;
+                check_bool(
+                    SetConsoleMode(self.write.as_raw_handle() as *mut _, self.saved_output),
+                    "SetConsoleMode(CONOUT$ restore) failed",
+                )?;
             }
             Ok(())
         }
 
         pub fn set_raw(&mut self) -> anyhow::Result<()> {
             unsafe {
-                SetConsoleMode(
-                    self.read.as_raw_file_descriptor() as *mut _,
-                    ENABLE_VIRTUAL_TERMINAL_INPUT,
-                );
-                SetConsoleMode(
-                    self.write.as_raw_file_descriptor() as *mut _,
-                    ENABLE_PROCESSED_OUTPUT
-                        | ENABLE_WRAP_AT_EOL_OUTPUT
-                        | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-                        | DISABLE_NEWLINE_AUTO_RETURN,
-                );
+                check_bool(
+                    SetConsoleMode(
+                        self.read.as_raw_file_descriptor() as *mut _,
+                        ENABLE_VIRTUAL_TERMINAL_INPUT,
+                    ),
+                    "SetConsoleMode(CONIN$ raw) failed",
+                )?;
+                check_bool(
+                    SetConsoleMode(
+                        self.write.as_raw_file_descriptor() as *mut _,
+                        ENABLE_PROCESSED_OUTPUT
+                            | ENABLE_WRAP_AT_EOL_OUTPUT
+                            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                            | DISABLE_NEWLINE_AUTO_RETURN,
+                    ),
+                    "SetConsoleMode(CONOUT$ raw) failed",
+                )?;
             }
             Ok(())
         }
 
         pub fn set_bridge_mode(&mut self) -> anyhow::Result<()> {
             unsafe {
-                SetConsoleMode(
-                    self.read.as_raw_file_descriptor() as *mut _,
-                    ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT,
-                );
-                SetConsoleMode(
-                    self.write.as_raw_file_descriptor() as *mut _,
-                    ENABLE_PROCESSED_OUTPUT
-                        | ENABLE_WRAP_AT_EOL_OUTPUT
-                        | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-                        | DISABLE_NEWLINE_AUTO_RETURN,
-                );
+                check_bool(
+                    SetConsoleMode(
+                        self.read.as_raw_file_descriptor() as *mut _,
+                        ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT,
+                    ),
+                    "SetConsoleMode(CONIN$ bridge) failed",
+                )?;
+                check_bool(
+                    SetConsoleMode(
+                        self.write.as_raw_file_descriptor() as *mut _,
+                        ENABLE_PROCESSED_OUTPUT
+                            | ENABLE_WRAP_AT_EOL_OUTPUT
+                            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                            | DISABLE_NEWLINE_AUTO_RETURN,
+                    ),
+                    "SetConsoleMode(CONOUT$ bridge) failed",
+                )?;
             }
             Ok(())
         }
@@ -481,6 +515,9 @@ struct InputModeTracker {
 
 #[cfg(windows)]
 impl InputModeTracker {
+    // TODO: Track DECCKM (?1h/l) for application cursor keys, and eventually
+    // filter input-mode sequences from child output so record owns the outer
+    // terminal's win32-input/mouse/paste/focus state instead of only observing it.
     fn new(state: Arc<Mutex<InnerInputState>>) -> Self {
         Self {
             state,
@@ -546,6 +583,8 @@ struct WinInputEncoder {
 
 #[cfg(windows)]
 impl WinInputEncoder {
+    // TODO: Add legacy mouse, horizontal wheel, focus-event, and explicit paste
+    // boundary handling once the main keyboard/mouse bridge semantics are stable.
     fn encode_records(
         &mut self,
         parser: &mut termwiz::input::InputParser,
@@ -565,6 +604,9 @@ impl WinInputEncoder {
                     if key.bKeyDown != 0 {
                         let unicode = *unsafe { key.uChar.UnicodeChar() };
                         if unicode != 0 {
+                            // TODO: Distinguish physical printable key events from terminal
+                            // response byte streams (DA/CPR). Encoding all printable chars as
+                            // Win32 input corrupts terminal responses in nested record sessions.
                             if let Some(ch) = std::char::from_u32(unicode as u32) {
                                 let mut buf = [0u8; 4];
                                 output.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
@@ -861,6 +903,8 @@ impl RecordCommand {
                     let records = input.read_console_input(128)?;
                     for record in &records {
                         if record.EventType == winapi::um::wincon::WINDOW_BUFFER_SIZE_EVENT {
+                            // TODO: Re-read CONOUT$ screen buffer info here so resize uses
+                            // viewport dimensions rather than the console buffer size.
                             let size = unsafe { record.Event.WindowBufferSizeEvent() };
                             tx.send(Message::Resize(PtySize {
                                 rows: size.dwSize.Y as u16,
