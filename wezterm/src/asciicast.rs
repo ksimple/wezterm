@@ -687,15 +687,6 @@ impl InputModeTracker {
 #[derive(Debug, Default)]
 struct WinInputEncoder {
     last_mouse_buttons: u32,
-    pending_terminal_response: Vec<u8>,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalResponseStatus {
-    No,
-    Possible,
-    Complete,
 }
 
 #[cfg(windows)]
@@ -722,11 +713,6 @@ impl WinInputEncoder {
             let record = &records[index];
             match record.EventType {
                 KEY_EVENT => {
-                    if let Some(consumed) = self.try_consume_terminal_response(records, index) {
-                        index += consumed;
-                        continue;
-                    }
-
                     if state.win32_input {
                         output.extend_from_slice(
                             Self::encode_win32_key(unsafe { record.Event.KeyEvent() }).as_bytes(),
@@ -808,116 +794,6 @@ impl WinInputEncoder {
             }
             _ => {}
         }
-    }
-
-    fn try_consume_terminal_response(
-        &mut self,
-        records: &[winapi::um::wincon::INPUT_RECORD],
-        start: usize,
-    ) -> Option<usize> {
-        let had_pending = !self.pending_terminal_response.is_empty();
-        let mut response = std::mem::take(&mut self.pending_terminal_response);
-        let mut index = start;
-        while let Some(record) = records.get(index) {
-            if record.EventType != winapi::um::wincon::KEY_EVENT {
-                if had_pending {
-                    self.pending_terminal_response.clear();
-                }
-                return None;
-            }
-            let ch = Self::raw_response_char(unsafe { record.Event.KeyEvent() })?;
-            if response.is_empty() && ch != '\x1b' && ch != '[' {
-                return None;
-            }
-            let mut buf = [0u8; 4];
-            response.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-
-            match Self::terminal_response_status(&response) {
-                TerminalResponseStatus::Complete => return Some(index - start + 1),
-                TerminalResponseStatus::Possible => {
-                    index += 1;
-                    continue;
-                }
-                TerminalResponseStatus::No => return None,
-            }
-        }
-
-        if matches!(
-            Self::terminal_response_status(&response),
-            TerminalResponseStatus::Possible
-        ) {
-            self.pending_terminal_response = response;
-            Some(index - start)
-        } else {
-            None
-        }
-    }
-
-    fn raw_response_char(key: &winapi::um::wincon::KEY_EVENT_RECORD) -> Option<char> {
-        if key.bKeyDown == 0 {
-            return None;
-        }
-        let unicode = *unsafe { key.uChar.UnicodeChar() };
-        if unicode == 0 {
-            return None;
-        }
-        std::char::from_u32(unicode as u32)
-    }
-
-    fn terminal_response_status(bytes: &[u8]) -> TerminalResponseStatus {
-        if !bytes.starts_with(b"\x1b") {
-            return if bytes.starts_with(b"[") {
-                Self::csi_response_status(&bytes[1..])
-            } else {
-                TerminalResponseStatus::No
-            };
-        }
-        match bytes {
-            b"\x1b" => return TerminalResponseStatus::Possible,
-            b"\x1b[" | b"\x1bO" => return TerminalResponseStatus::Possible,
-            _ => {}
-        }
-
-        if bytes.starts_with(b"\x1b[") {
-            return Self::csi_response_status(&bytes[2..]);
-        }
-
-        if bytes.starts_with(b"\x1bO") {
-            return if bytes.len() == 3 && (0x40..=0x7e).contains(&bytes[2]) {
-                TerminalResponseStatus::Complete
-            } else if bytes.len() < 3 {
-                TerminalResponseStatus::Possible
-            } else {
-                TerminalResponseStatus::No
-            };
-        }
-
-        TerminalResponseStatus::No
-    }
-
-    fn csi_response_status(body: &[u8]) -> TerminalResponseStatus {
-        let Some((&final_byte, params)) = body.split_last() else {
-            return TerminalResponseStatus::Possible;
-        };
-        if matches!(final_byte, b'R' | b'c' | b'n') {
-            let allowed_params = params
-                .iter()
-                .all(|b| matches!(*b, b'0'..=b'9' | b';' | b'?' | b'>' | b'!' | b' '));
-            if allowed_params {
-                return TerminalResponseStatus::Complete;
-            }
-            return TerminalResponseStatus::No;
-        }
-        if (0x40..=0x7e).contains(&final_byte) {
-            return TerminalResponseStatus::No;
-        }
-        if body
-            .iter()
-            .all(|b| matches!(*b, b'0'..=b'9' | b';' | b'?' | b'>' | b'!' | b' '))
-        {
-            return TerminalResponseStatus::Possible;
-        }
-        TerminalResponseStatus::No
     }
 
     fn encode_win32_key(key: &winapi::um::wincon::KEY_EVENT_RECORD) -> String {
@@ -1204,6 +1080,32 @@ mod windows_input_bridge_tests {
     }
 
     #[test]
+    fn mouse_mode_precedence_falls_back_when_modes_reset() {
+        let (state, mut tracker) = tracker();
+
+        assert_eq!(tracker.filter(b"\x1b[?1000;1002;1003h"), b"");
+        assert_eq!(
+            state.lock().unwrap().mouse_tracking,
+            MouseTrackingMode::AnyEvent
+        );
+        assert_eq!(tracker.filter(b"\x1b[?1003l"), b"");
+        assert_eq!(
+            state.lock().unwrap().mouse_tracking,
+            MouseTrackingMode::ButtonEvent
+        );
+        assert_eq!(tracker.filter(b"\x1b[?1002l"), b"");
+        assert_eq!(
+            state.lock().unwrap().mouse_tracking,
+            MouseTrackingMode::Default
+        );
+        assert_eq!(tracker.filter(b"\x1b[?1000l"), b"");
+        assert_eq!(
+            state.lock().unwrap().mouse_tracking,
+            MouseTrackingMode::None
+        );
+    }
+
+    #[test]
     fn application_cursor_mode_changes_arrow_encoding() {
         let mut encoder = WinInputEncoder::default();
         let mut parser = termwiz::input::InputParser::new();
@@ -1266,54 +1168,7 @@ mod windows_input_bridge_tests {
     }
 
     #[test]
-    fn win32_input_consumes_complete_terminal_responses() {
-        let mut encoder = WinInputEncoder::default();
-        let mut parser = termwiz::input::InputParser::new();
-        let records = [
-            key_record(winuser::VK_ESCAPE as u16, 1, '\x1b', true, 1, 0),
-            key_record('[' as u16, 0, '[', true, 1, 0),
-            key_record('?' as u16, 0, '?', true, 1, 0),
-            key_record('6' as u16, 0, '6', true, 1, 0),
-            key_record('1' as u16, 0, '1', true, 1, 0),
-            key_record('c' as u16, 0, 'c', true, 1, 0),
-            key_record('A' as u16, 0x1e, 'a', true, 1, 0),
-        ];
-        let state = InnerInputState {
-            win32_input: true,
-            ..Default::default()
-        };
-
-        assert_eq!(
-            encoder.encode_records(&mut parser, &records, &state),
-            b"\x1b[65;30;97;1;0;1_"
-        );
-    }
-
-    #[test]
-    fn win32_input_consumes_bare_csi_terminal_responses() {
-        let mut encoder = WinInputEncoder::default();
-        let mut parser = termwiz::input::InputParser::new();
-        let records = [
-            key_record('[' as u16, 0, '[', true, 1, 0),
-            key_record('?' as u16, 0, '?', true, 1, 0),
-            key_record('6' as u16, 0, '6', true, 1, 0),
-            key_record('1' as u16, 0, '1', true, 1, 0),
-            key_record('c' as u16, 0, 'c', true, 1, 0),
-            key_record('A' as u16, 0x1e, 'a', true, 1, 0),
-        ];
-        let state = InnerInputState {
-            win32_input: true,
-            ..Default::default()
-        };
-
-        assert_eq!(
-            encoder.encode_records(&mut parser, &records, &state),
-            b"\x1b[65;30;97;1;0;1_"
-        );
-    }
-
-    #[test]
-    fn consumes_terminal_responses_before_mode_state_catches_up() {
+    fn response_like_text_is_not_swallowed_in_plain_mode() {
         let mut encoder = WinInputEncoder::default();
         let mut parser = termwiz::input::InputParser::new();
         let records = [
@@ -1327,12 +1182,35 @@ mod windows_input_bridge_tests {
 
         assert_eq!(
             encoder.encode_records(&mut parser, &records, &InnerInputState::default()),
-            b"a"
+            b"[?61ca"
         );
     }
 
     #[test]
-    fn consumes_terminal_responses_split_across_batches() {
+    fn response_like_text_is_encoded_in_win32_mode() {
+        let mut encoder = WinInputEncoder::default();
+        let mut parser = termwiz::input::InputParser::new();
+        let records = [
+            key_record('[' as u16, 0, '[', true, 1, 0),
+            key_record('?' as u16, 0, '?', true, 1, 0),
+            key_record('6' as u16, 0, '6', true, 1, 0),
+            key_record('1' as u16, 0, '1', true, 1, 0),
+            key_record('c' as u16, 0, 'c', true, 1, 0),
+            key_record('A' as u16, 0x1e, 'a', true, 1, 0),
+        ];
+        let state = InnerInputState {
+            win32_input: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            encoder.encode_records(&mut parser, &records, &state),
+            b"\x1b[91;0;91;1;0;1_\x1b[63;0;63;1;0;1_\x1b[54;0;54;1;0;1_\x1b[49;0;49;1;0;1_\x1b[99;0;99;1;0;1_\x1b[65;30;97;1;0;1_"
+        );
+    }
+
+    #[test]
+    fn split_response_like_text_is_not_swallowed() {
         let mut encoder = WinInputEncoder::default();
         let mut parser = termwiz::input::InputParser::new();
         let first = [
@@ -1348,11 +1226,11 @@ mod windows_input_bridge_tests {
 
         assert_eq!(
             encoder.encode_records(&mut parser, &first, &InnerInputState::default()),
-            b""
+            b"[?61"
         );
         assert_eq!(
             encoder.encode_records(&mut parser, &second, &InnerInputState::default()),
-            b"a"
+            b"ca"
         );
     }
 
@@ -1532,6 +1410,33 @@ mod windows_input_bridge_tests {
             b"\x1b[I"
         );
     }
+
+    #[test]
+    fn focus_disabled_emits_nothing_and_focus_lost_encodes() {
+        let mut focus: FOCUS_EVENT_RECORD = unsafe { std::mem::zeroed() };
+        focus.bSetFocus = 0;
+        let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+        record.EventType = FOCUS_EVENT;
+        unsafe {
+            *record.Event.FocusEvent_mut() = focus;
+        }
+        let mut encoder = WinInputEncoder::default();
+        let mut parser = termwiz::input::InputParser::new();
+
+        assert_eq!(
+            encoder.encode_records(&mut parser, &[record], &InnerInputState::default()),
+            b""
+        );
+
+        let state = InnerInputState {
+            focus: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encoder.encode_records(&mut parser, &[record], &state),
+            b"\x1b[O"
+        );
+    }
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -1668,13 +1573,22 @@ impl RecordCommand {
                 let mut encoder = WinInputEncoder::default();
                 loop {
                     let records = input.read_console_input(128)?;
+                    let state = state.lock().map(|state| state.clone()).unwrap_or_default();
+                    let mut pending_input_records = Vec::new();
                     for record in &records {
                         if record.EventType == winapi::um::wincon::WINDOW_BUFFER_SIZE_EVENT {
+                            let data =
+                                encoder.encode_records(&mut parser, &pending_input_records, &state);
+                            pending_input_records.clear();
+                            if !data.is_empty() {
+                                tx.send(Message::Stdin(data))?;
+                            }
                             tx.send(Message::Resize(input.get_size()?))?;
+                        } else {
+                            pending_input_records.push(*record);
                         }
                     }
-                    let state = state.lock().map(|state| state.clone()).unwrap_or_default();
-                    let data = encoder.encode_records(&mut parser, &records, &state);
+                    let data = encoder.encode_records(&mut parser, &pending_input_records, &state);
                     if !data.is_empty() {
                         tx.send(Message::Stdin(data))?;
                     }
