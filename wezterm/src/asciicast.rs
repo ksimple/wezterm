@@ -1,7 +1,7 @@
 use anyhow::Context;
 use chrono::serde::ts_seconds_option;
 use chrono::{DateTime, Utc};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use config::ConfigHandle;
 use filedescriptor::FileDescriptor;
 use portable_pty::{native_pty_system, PtySize};
@@ -11,6 +11,8 @@ use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
+#[cfg(windows)]
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use termwiz::escape::parser::Parser as TWParser;
 use termwiz::escape::Action;
@@ -202,6 +204,29 @@ mod win {
             Ok(())
         }
 
+        pub fn set_bridge_mode(&mut self) -> anyhow::Result<()> {
+            unsafe {
+                SetConsoleMode(
+                    self.read.as_raw_file_descriptor() as *mut _,
+                    ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT,
+                );
+                SetConsoleMode(
+                    self.write.as_raw_file_descriptor() as *mut _,
+                    ENABLE_PROCESSED_OUTPUT
+                        | ENABLE_WRAP_AT_EOL_OUTPUT
+                        | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                        | DISABLE_NEWLINE_AUTO_RETURN,
+                );
+            }
+            Ok(())
+        }
+
+        pub fn reset_outer_input_modes(&mut self) -> anyhow::Result<()> {
+            self.write_all(
+                b"\x1b[?9001l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l",
+            )
+        }
+
         pub fn get_size(&self) -> anyhow::Result<PtySize> {
             let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
             let ok = unsafe {
@@ -232,6 +257,12 @@ mod win {
             Ok(self.read.try_clone()?)
         }
 
+        pub fn input_reader(&self) -> anyhow::Result<WinInputReader> {
+            Ok(WinInputReader {
+                read: self.read.try_clone()?,
+            })
+        }
+
         pub fn write_all(&mut self, data: &[u8]) -> anyhow::Result<()> {
             Ok(self.write.write_all(data)?)
         }
@@ -240,6 +271,40 @@ mod win {
     impl Drop for WinTty {
         fn drop(&mut self) {
             let _ = self.set_cooked();
+        }
+    }
+
+    pub struct WinInputReader {
+        read: FileDescriptor,
+    }
+
+    impl WinInputReader {
+        pub fn read_console_input(
+            &mut self,
+            num_events: usize,
+        ) -> anyhow::Result<Vec<INPUT_RECORD>> {
+            let mut records = Vec::with_capacity(num_events);
+            let empty_record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+            records.resize(num_events, empty_record);
+
+            let mut num_read = 0;
+            if unsafe {
+                ReadConsoleInputW(
+                    self.read.as_raw_handle() as *mut _,
+                    records.as_mut_ptr(),
+                    num_events as u32,
+                    &mut num_read,
+                )
+            } == 0
+            {
+                anyhow::bail!(
+                    "ReadConsoleInputW failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            unsafe { records.set_len(num_read as usize) };
+            Ok(records)
         }
     }
 }
@@ -331,8 +396,333 @@ enum Message {
     Stdin(Vec<u8>),
     /// Output from the child tty
     Stdout(Vec<u8>),
+    /// Terminal window size changed
+    Resize(PtySize),
     /// Child process terminated
     Terminated(portable_pty::ExitStatus),
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+enum WinInputMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseTrackingMode {
+    None,
+    Default,
+    ButtonEvent,
+    AnyEvent,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+struct InnerInputState {
+    mouse_default: bool,
+    mouse_button_event: bool,
+    mouse_any_event: bool,
+    mouse_tracking: MouseTrackingMode,
+    sgr_mouse: bool,
+    focus: bool,
+    bracketed_paste: bool,
+    win32_input: bool,
+}
+
+#[cfg(windows)]
+impl Default for InnerInputState {
+    fn default() -> Self {
+        Self {
+            mouse_default: false,
+            mouse_button_event: false,
+            mouse_any_event: false,
+            mouse_tracking: MouseTrackingMode::None,
+            sgr_mouse: false,
+            focus: false,
+            bracketed_paste: false,
+            win32_input: false,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl InnerInputState {
+    fn set_mode(&mut self, mode: u16, enabled: bool) {
+        match mode {
+            1000 => self.mouse_default = enabled,
+            1002 => self.mouse_button_event = enabled,
+            1003 => self.mouse_any_event = enabled,
+            1004 => self.focus = enabled,
+            1006 => self.sgr_mouse = enabled,
+            2004 => self.bracketed_paste = enabled,
+            9001 => self.win32_input = enabled,
+            _ => {}
+        }
+        self.mouse_tracking = if self.mouse_any_event {
+            MouseTrackingMode::AnyEvent
+        } else if self.mouse_button_event {
+            MouseTrackingMode::ButtonEvent
+        } else if self.mouse_default {
+            MouseTrackingMode::Default
+        } else {
+            MouseTrackingMode::None
+        };
+    }
+}
+
+#[cfg(windows)]
+struct InputModeTracker {
+    state: Arc<Mutex<InnerInputState>>,
+    pending: Vec<u8>,
+}
+
+#[cfg(windows)]
+impl InputModeTracker {
+    fn new(state: Arc<Mutex<InnerInputState>>) -> Self {
+        Self {
+            state,
+            pending: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        let mut data = std::mem::take(&mut self.pending);
+        data.extend_from_slice(bytes);
+
+        let mut i = 0;
+        while i < data.len() {
+            if data[i] != 0x1b {
+                i += 1;
+                continue;
+            }
+
+            if i + 2 >= data.len() {
+                self.pending.extend_from_slice(&data[i..]);
+                break;
+            }
+
+            if data[i + 1] != b'[' || data[i + 2] != b'?' {
+                i += 1;
+                continue;
+            }
+
+            let mut end = i + 3;
+            while end < data.len() && !(0x40..=0x7e).contains(&data[end]) {
+                end += 1;
+            }
+
+            if end == data.len() {
+                self.pending.extend_from_slice(&data[i..]);
+                break;
+            }
+
+            let final_byte = data[end];
+            if final_byte == b'h' || final_byte == b'l' {
+                let enabled = final_byte == b'h';
+                if let Ok(params) = std::str::from_utf8(&data[i + 3..end]) {
+                    if let Ok(mut state) = self.state.lock() {
+                        for param in params.split(';') {
+                            if let Ok(mode) = param.parse::<u16>() {
+                                state.set_mode(mode, enabled);
+                            }
+                        }
+                    }
+                }
+            }
+
+            i = end + 1;
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct WinInputEncoder {
+    last_mouse_buttons: u32,
+}
+
+#[cfg(windows)]
+impl WinInputEncoder {
+    fn encode_records(
+        &mut self,
+        parser: &mut termwiz::input::InputParser,
+        records: &[winapi::um::wincon::INPUT_RECORD],
+        state: &InnerInputState,
+    ) -> Vec<u8> {
+        use termwiz::input::{InputEvent, KeyCodeEncodeModes, KeyboardEncoding};
+        use winapi::um::wincon::*;
+
+        let mut non_char_key_records = Vec::new();
+        let mut output = Vec::new();
+
+        for record in records {
+            match record.EventType {
+                KEY_EVENT => {
+                    let key = unsafe { record.Event.KeyEvent() };
+                    if key.bKeyDown != 0 {
+                        let unicode = *unsafe { key.uChar.UnicodeChar() };
+                        if unicode != 0 {
+                            if let Some(ch) = std::char::from_u32(unicode as u32) {
+                                let mut buf = [0u8; 4];
+                                output.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                                continue;
+                            }
+                        }
+                    }
+                    non_char_key_records.push(*record);
+                }
+                MOUSE_EVENT => {
+                    if let Some(mouse) =
+                        self.encode_mouse(unsafe { record.Event.MouseEvent() }, state)
+                    {
+                        output.extend_from_slice(mouse.as_bytes());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if state.win32_input {
+            for record in non_char_key_records {
+                if record.EventType == KEY_EVENT {
+                    output.extend_from_slice(
+                        Self::encode_win32_key(unsafe { record.Event.KeyEvent() }).as_bytes(),
+                    );
+                }
+            }
+            return output;
+        }
+
+        let modes = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            application_cursor_keys: false,
+            newline_mode: false,
+            modify_other_keys: None,
+        };
+
+        for event in parser.decode_input_records_as_vec(&non_char_key_records) {
+            match event {
+                InputEvent::Key(key) => {
+                    if let Ok(encoded) = key.key.encode(key.modifiers, modes, true) {
+                        output.extend_from_slice(encoded.as_bytes());
+                    }
+                }
+                InputEvent::Paste(paste) => {
+                    if state.bracketed_paste {
+                        output.extend_from_slice(b"\x1b[200~");
+                        output.extend_from_slice(paste.as_bytes());
+                        output.extend_from_slice(b"\x1b[201~");
+                    } else {
+                        output.extend_from_slice(paste.as_bytes());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        output
+    }
+
+    fn encode_win32_key(key: &winapi::um::wincon::KEY_EVENT_RECORD) -> String {
+        let key_down = if key.bKeyDown != 0 { 1 } else { 0 };
+        let unicode = *unsafe { key.uChar.UnicodeChar() } as u32;
+        format!(
+            "\x1b[{};{};{};{};{};{}_",
+            key.wVirtualKeyCode,
+            key.wVirtualScanCode,
+            unicode,
+            key_down,
+            key.dwControlKeyState,
+            key.wRepeatCount
+        )
+    }
+
+    fn encode_mouse(
+        &mut self,
+        mouse: &winapi::um::wincon::MOUSE_EVENT_RECORD,
+        state: &InnerInputState,
+    ) -> Option<String> {
+        use winapi::um::wincon::*;
+
+        if state.mouse_tracking == MouseTrackingMode::None || !state.sgr_mouse {
+            self.last_mouse_buttons = mouse.dwButtonState;
+            return None;
+        }
+
+        let is_move = (mouse.dwEventFlags & MOUSE_MOVED) != 0;
+        let is_wheel = (mouse.dwEventFlags & MOUSE_WHEELED) != 0;
+        let physical_button_pressed = mouse.dwButtonState
+            & (FROM_LEFT_1ST_BUTTON_PRESSED
+                | FROM_LEFT_2ND_BUTTON_PRESSED
+                | RIGHTMOST_BUTTON_PRESSED)
+            != 0;
+
+        let should_send = match state.mouse_tracking {
+            MouseTrackingMode::None => false,
+            MouseTrackingMode::Default => !is_move,
+            MouseTrackingMode::ButtonEvent => !is_move || physical_button_pressed,
+            MouseTrackingMode::AnyEvent => true,
+        };
+
+        if !should_send {
+            self.last_mouse_buttons = mouse.dwButtonState;
+            return None;
+        }
+
+        let mut code = if is_wheel {
+            let delta = ((mouse.dwButtonState >> 16) & 0xffff) as i16;
+            if delta > 0 {
+                64
+            } else {
+                65
+            }
+        } else if is_move && !physical_button_pressed {
+            3
+        } else {
+            let buttons = if mouse.dwButtonState != 0 {
+                mouse.dwButtonState
+            } else {
+                self.last_mouse_buttons
+            };
+            if (buttons & FROM_LEFT_1ST_BUTTON_PRESSED) != 0 {
+                0
+            } else if (buttons & FROM_LEFT_2ND_BUTTON_PRESSED) != 0 {
+                1
+            } else if (buttons & RIGHTMOST_BUTTON_PRESSED) != 0 {
+                2
+            } else {
+                3
+            }
+        };
+
+        if is_move {
+            code += 32;
+        }
+        if (mouse.dwControlKeyState & SHIFT_PRESSED) != 0 {
+            code += 4;
+        }
+        if (mouse.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0 {
+            code += 8;
+        }
+        if (mouse.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0 {
+            code += 16;
+        }
+
+        let is_release =
+            !is_move && !is_wheel && mouse.dwButtonState == 0 && self.last_mouse_buttons != 0;
+        self.last_mouse_buttons = mouse.dwButtonState;
+
+        Some(format!(
+            "\x1b[<{};{};{}{}",
+            code,
+            mouse.dwMousePosition.X + 1,
+            mouse.dwMousePosition.Y + 1,
+            if is_release { 'm' } else { 'M' }
+        ))
+    }
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -346,6 +736,10 @@ pub struct RecordCommand {
     /// using a random file name in the temp directory
     #[arg(short)]
     outfile: Option<std::path::PathBuf>,
+
+    /// Windows input bridge mode for preserving Console input semantics
+    #[arg(long = "win-input", default_value = "auto")]
+    win_input: WinInputMode,
 
     /// Start prog instead of the default_prog defined by your
     /// wezterm configuration
@@ -400,7 +794,43 @@ impl RecordCommand {
         drop(pair.slave);
         let mut child_output = pair.master.try_clone_reader()?;
 
+        #[cfg(windows)]
+        let use_win_input_bridge = match self.win_input {
+            WinInputMode::Off => {
+                tty.set_raw()?;
+                false
+            }
+            WinInputMode::Auto => match tty.set_bridge_mode() {
+                Ok(()) => true,
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed to initialize Windows input bridge: {err:#}; falling back to legacy input forwarding"
+                    );
+                    tty.set_raw()?;
+                    false
+                }
+            },
+            WinInputMode::On => {
+                tty.set_bridge_mode()?;
+                true
+            }
+        };
+        #[cfg(windows)]
+        if use_win_input_bridge {
+            let _ = tty.reset_outer_input_modes();
+        }
+
+        #[cfg(not(windows))]
         tty.set_raw()?;
+
+        #[cfg(windows)]
+        let inner_input_state = Arc::new(Mutex::new(InnerInputState::default()));
+        #[cfg(windows)]
+        let mut input_mode_tracker = if use_win_input_bridge {
+            Some(InputModeTracker::new(Arc::clone(&inner_input_state)))
+        } else {
+            None
+        };
 
         let (tx, rx) = channel();
 
@@ -419,6 +849,54 @@ impl RecordCommand {
             });
         }
 
+        #[cfg(windows)]
+        if use_win_input_bridge {
+            let mut input = tty.input_reader()?;
+            let tx = tx.clone();
+            let state = Arc::clone(&inner_input_state);
+            std::thread::spawn(move || -> anyhow::Result<()> {
+                let mut parser = termwiz::input::InputParser::new();
+                let mut encoder = WinInputEncoder::default();
+                loop {
+                    let records = input.read_console_input(128)?;
+                    for record in &records {
+                        if record.EventType == winapi::um::wincon::WINDOW_BUFFER_SIZE_EVENT {
+                            let size = unsafe { record.Event.WindowBufferSizeEvent() };
+                            tx.send(Message::Resize(PtySize {
+                                rows: size.dwSize.Y as u16,
+                                cols: size.dwSize.X as u16,
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            }))?;
+                        }
+                    }
+                    let state = state.lock().map(|state| state.clone()).unwrap_or_default();
+                    let data = encoder.encode_records(&mut parser, &records, &state);
+                    if !data.is_empty() {
+                        tx.send(Message::Stdin(data))?;
+                    }
+                }
+            });
+        }
+
+        #[cfg(windows)]
+        if !use_win_input_bridge {
+            let mut stdin = tty.reader()?;
+            let tx = tx.clone();
+            std::thread::spawn(move || -> anyhow::Result<()> {
+                let mut buf = [0u8; 8192];
+                loop {
+                    let size = stdin.read(&mut buf)?;
+                    if size == 0 {
+                        break;
+                    }
+                    tx.send(Message::Stdin(buf[0..size].to_vec()))?;
+                }
+                Ok(())
+            });
+        }
+
+        #[cfg(not(windows))]
         {
             let mut stdin = tty.reader()?;
             let tx = tx.clone();
@@ -456,6 +934,10 @@ impl RecordCommand {
                 }
                 Message::Stdout(mut data) => {
                     let elapsed = first_output.elapsed().as_secs_f32();
+                    #[cfg(windows)]
+                    if let Some(tracker) = input_mode_tracker.as_mut() {
+                        tracker.observe(&data);
+                    }
                     tty.write_all(&data)?;
 
                     // The end of the data may be an incomplete utf8 sequence
@@ -483,6 +965,9 @@ impl RecordCommand {
                         }
                     }
                 }
+                Message::Resize(size) => {
+                    pair.master.resize(size)?;
+                }
                 Message::Terminated(status) => {
                     child_status.replace(status);
                     break;
@@ -490,6 +975,10 @@ impl RecordCommand {
             }
         }
 
+        #[cfg(windows)]
+        if use_win_input_bridge {
+            let _ = tty.reset_outer_input_modes();
+        }
         tty.set_cooked()?;
         eprintln!("Child status: {:?}", child_status);
         cast_file.flush()?;
