@@ -671,9 +671,11 @@ impl InputModeTracker {
         let mut passthrough_modes = Vec::new();
 
         for param in params.split(';') {
-            match param.parse::<u16>() {
-                Ok(mode) if Self::owns_dec_private_mode(mode) => owned_modes.push(mode),
-                Ok(_) | Err(_) => passthrough_modes.push(param.to_string()),
+            let mode = param.parse::<u16>().ok()?;
+            if Self::owns_dec_private_mode(mode) {
+                owned_modes.push(mode);
+            } else {
+                passthrough_modes.push(param.to_string());
             }
         }
 
@@ -882,7 +884,7 @@ impl WinInputEncoder {
             FROM_LEFT_1ST_BUTTON_PRESSED | FROM_LEFT_2ND_BUTTON_PRESSED | RIGHTMOST_BUTTON_PRESSED;
 
         if state.mouse_tracking == MouseTrackingMode::None {
-            self.last_mouse_buttons = mouse.dwButtonState & PHYSICAL_BUTTONS;
+            self.last_mouse_buttons = 0;
             return None;
         }
 
@@ -890,12 +892,16 @@ impl WinInputEncoder {
         let is_wheel = (mouse.dwEventFlags & MOUSE_WHEELED) != 0;
         let is_horizontal_wheel = (mouse.dwEventFlags & MOUSE_HWHEELED) != 0;
         let physical_button_pressed = mouse.dwButtonState & PHYSICAL_BUTTONS != 0;
+        let button_event = physical_button_pressed
+            || self.last_mouse_buttons != 0
+            || is_wheel
+            || is_horizontal_wheel;
 
         let should_send = match state.mouse_tracking {
             MouseTrackingMode::None => false,
-            MouseTrackingMode::Default => !is_move,
-            MouseTrackingMode::ButtonEvent => !is_move || physical_button_pressed,
-            MouseTrackingMode::AnyEvent => true,
+            MouseTrackingMode::Default => !is_move && button_event,
+            MouseTrackingMode::ButtonEvent => (!is_move && button_event) || physical_button_pressed,
+            MouseTrackingMode::AnyEvent => is_move || button_event,
         };
 
         if !should_send {
@@ -1040,6 +1046,30 @@ mod windows_input_bridge_tests {
         record
     }
 
+    fn key_record_u16(
+        virtual_key: u16,
+        scan_code: u16,
+        unicode: u16,
+        key_down: bool,
+        repeat_count: u16,
+        control_state: u32,
+    ) -> INPUT_RECORD {
+        let mut key: KEY_EVENT_RECORD = unsafe { std::mem::zeroed() };
+        key.bKeyDown = if key_down { TRUE } else { 0 };
+        key.wRepeatCount = repeat_count;
+        key.wVirtualKeyCode = virtual_key;
+        key.wVirtualScanCode = scan_code;
+        key.dwControlKeyState = control_state;
+        *unsafe { key.uChar.UnicodeChar_mut() } = unicode;
+
+        let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+        record.EventType = KEY_EVENT;
+        unsafe {
+            *record.Event.KeyEvent_mut() = key;
+        }
+        record
+    }
+
     fn mouse_input_record(mouse: MOUSE_EVENT_RECORD) -> INPUT_RECORD {
         let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
         record.EventType = MOUSE_EVENT;
@@ -1081,6 +1111,72 @@ mod windows_input_bridge_tests {
         let output = tracker.filter(b"\x1b[?25;1000h");
 
         assert_eq!(output, b"\x1b[?25h");
+        assert_eq!(
+            state.lock().unwrap().mouse_tracking,
+            MouseTrackingMode::Default
+        );
+    }
+
+    #[test]
+    fn malformed_dec_private_modes_are_preserved_without_state_changes() {
+        let (state, mut tracker) = tracker();
+
+        assert_eq!(tracker.filter(b"\x1b[?1000;badh"), b"\x1b[?1000;badh");
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.mouse_tracking, MouseTrackingMode::None);
+        assert!(!state.mouse_default);
+    }
+
+    #[test]
+    fn non_private_sm_rm_with_owned_numbers_are_preserved() {
+        let (state, mut tracker) = tracker();
+
+        assert_eq!(
+            tracker.filter(b"\x1b[1000h\x1b[2004l"),
+            b"\x1b[1000h\x1b[2004l"
+        );
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.mouse_tracking, MouseTrackingMode::None);
+        assert!(!state.bracketed_paste);
+    }
+
+    #[test]
+    fn mixed_owned_unowned_reset_filters_only_owned_modes() {
+        let (state, mut tracker) = tracker();
+
+        assert_eq!(tracker.filter(b"\x1b[?1000;1006;2004h"), b"");
+        assert_eq!(tracker.filter(b"\x1b[?25;1000;1006;2004l"), b"\x1b[?25l");
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.mouse_tracking, MouseTrackingMode::None);
+        assert!(!state.sgr_mouse);
+        assert!(!state.bracketed_paste);
+    }
+
+    #[test]
+    fn repeated_private_mode_params_are_idempotent() {
+        let (state, mut tracker) = tracker();
+
+        assert_eq!(tracker.filter(b"\x1b[?1000;1000;25;25h"), b"\x1b[?25;25h");
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.mouse_tracking, MouseTrackingMode::Default);
+        assert!(state.mouse_default);
+    }
+
+    #[test]
+    fn set_reset_order_in_single_buffer_uses_last_state() {
+        let (state, mut tracker) = tracker();
+
+        assert_eq!(tracker.filter(b"\x1b[?1000h\x1b[?1000l"), b"");
+        assert_eq!(
+            state.lock().unwrap().mouse_tracking,
+            MouseTrackingMode::None
+        );
+
+        assert_eq!(tracker.filter(b"\x1b[?1000l\x1b[?1000h"), b"");
         assert_eq!(
             state.lock().unwrap().mouse_tracking,
             MouseTrackingMode::Default
@@ -1151,6 +1247,43 @@ mod windows_input_bridge_tests {
         let (output, responses) = tracker.filter_and_get_responses(b"0c");
         assert_eq!(output, b"");
         assert_eq!(responses, b"\x1b[>0;0;0c");
+    }
+
+    #[test]
+    fn terminal_query_near_misses_are_preserved_without_responses() {
+        let (_state, mut tracker) = tracker();
+
+        for query in [
+            b"\x1b[?6n".as_slice(),
+            b"\x1b[0n",
+            b"\x1b[>1c",
+            b"\x1b[?1;0c",
+        ] {
+            let (output, responses) = tracker.filter_and_get_responses(query);
+            assert_eq!(output, query);
+            assert_eq!(responses, b"");
+        }
+    }
+
+    #[test]
+    fn terminal_queries_work_when_split_at_every_byte() {
+        for (query, response) in [
+            (b"\x1b[c".as_slice(), b"\x1b[?1;0c".as_slice()),
+            (b"\x1b[0c", b"\x1b[?1;0c"),
+            (b"\x1b[>c", b"\x1b[>0;0;0c"),
+            (b"\x1b[>0c", b"\x1b[>0;0;0c"),
+            (b"\x1b[5n", b"\x1b[0n"),
+            (b"\x1b[6n", b"\x1b[1;1R"),
+        ] {
+            for split_at in 1..query.len() {
+                let (_state, mut tracker) = tracker();
+                assert_eq!(tracker.filter(&query[..split_at]), b"");
+                let (output, responses) = tracker.filter_and_get_responses(&query[split_at..]);
+                assert_eq!(output, b"");
+                assert_eq!(responses, response);
+                assert_eq!(tracker.drain_pending(), b"");
+            }
+        }
     }
 
     #[test]
@@ -1255,6 +1388,56 @@ mod windows_input_bridge_tests {
         assert_eq!(
             encoder.encode_records(&mut parser, &[a], &state),
             b"\x1b[65;30;97;1;0;2_"
+        );
+    }
+
+    #[test]
+    fn key_up_is_ignored_in_plain_mode_and_encoded_in_win32_mode() {
+        let mut encoder = WinInputEncoder::default();
+        let mut parser = termwiz::input::InputParser::new();
+        let a_up = key_record('A' as u16, 0x1e, 'a', false, 1, 0);
+
+        assert_eq!(
+            encoder.encode_records(&mut parser, &[a_up], &InnerInputState::default()),
+            b""
+        );
+
+        let state = InnerInputState {
+            win32_input: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encoder.encode_records(&mut parser, &[a_up], &state),
+            b"\x1b[65;30;97;0;0;1_"
+        );
+    }
+
+    #[test]
+    fn repeats_non_printable_key_records() {
+        let mut encoder = WinInputEncoder::default();
+        let mut parser = termwiz::input::InputParser::new();
+        let up = key_record(winuser::VK_UP as u16, 0x48, '\0', true, 3, 0);
+
+        assert_eq!(
+            encoder.encode_records(&mut parser, &[up], &InnerInputState::default()),
+            b"\x1b[A\x1b[A\x1b[A"
+        );
+    }
+
+    #[test]
+    fn plain_text_preserves_bmp_unicode_and_ignores_unpaired_surrogates() {
+        let mut encoder = WinInputEncoder::default();
+        let mut parser = termwiz::input::InputParser::new();
+        let e_acute = key_record(0, 0, 'é', true, 2, 0);
+        let high_surrogate = key_record_u16(0, 0, 0xd83d, true, 1, 0);
+
+        assert_eq!(
+            encoder.encode_records(&mut parser, &[e_acute], &InnerInputState::default()),
+            "éé".as_bytes()
+        );
+        assert_eq!(
+            encoder.encode_records(&mut parser, &[high_surrogate], &InnerInputState::default()),
+            b""
         );
     }
 
@@ -1423,7 +1606,7 @@ mod windows_input_bridge_tests {
         );
         assert_eq!(
             encoder.encode_mouse(&mouse_record(0, 0, 0, 0, 0), &state),
-            Some(b"\x1b[<3;1;1M".to_vec())
+            None
         );
     }
 
@@ -1570,6 +1753,95 @@ mod windows_input_bridge_tests {
         assert_eq!(
             encoder.encode_mouse(&mouse, &state).unwrap(),
             vec![0x1b, b'[', b'M', 35, 33, 33]
+        );
+    }
+
+    #[test]
+    fn mouse_modifiers_are_encoded() {
+        let mut encoder = WinInputEncoder::default();
+        let state = InnerInputState {
+            mouse_default: true,
+            mouse_tracking: MouseTrackingMode::Default,
+            sgr_mouse: true,
+            ..Default::default()
+        };
+        let mouse = mouse_record(
+            0,
+            0,
+            FROM_LEFT_1ST_BUTTON_PRESSED,
+            SHIFT_PRESSED | LEFT_ALT_PRESSED | RIGHT_CTRL_PRESSED,
+            0,
+        );
+
+        assert_eq!(
+            encoder.encode_mouse(&mouse, &state).unwrap(),
+            b"\x1b[<28;1;1M"
+        );
+    }
+
+    #[test]
+    fn legacy_mouse_rejects_coordinates_outside_protocol_range() {
+        let mut encoder = WinInputEncoder::default();
+        let state = InnerInputState {
+            mouse_default: true,
+            mouse_tracking: MouseTrackingMode::Default,
+            sgr_mouse: false,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            encoder.encode_mouse(
+                &mouse_record(222, 222, FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0),
+                &state
+            ),
+            Some(vec![0x1b, b'[', b'M', 32, 255, 255])
+        );
+        assert_eq!(
+            encoder.encode_mouse(
+                &mouse_record(223, 222, FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0),
+                &state
+            ),
+            None
+        );
+        assert_eq!(
+            encoder.encode_mouse(
+                &mouse_record(222, 223, FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0),
+                &state
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn mouse_disabled_while_button_held_does_not_emit_stale_release() {
+        let mut encoder = WinInputEncoder::default();
+        let enabled = InnerInputState {
+            mouse_default: true,
+            mouse_tracking: MouseTrackingMode::Default,
+            sgr_mouse: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            encoder
+                .encode_mouse(
+                    &mouse_record(0, 0, FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0),
+                    &enabled
+                )
+                .unwrap(),
+            b"\x1b[<0;1;1M"
+        );
+
+        assert_eq!(
+            encoder.encode_mouse(
+                &mouse_record(0, 0, FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0),
+                &InnerInputState::default()
+            ),
+            None
+        );
+        assert_eq!(
+            encoder.encode_mouse(&mouse_record(0, 0, 0, 0, 0), &enabled),
+            None
         );
     }
 
