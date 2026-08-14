@@ -1031,6 +1031,8 @@ impl WinInputEncoder {
 #[cfg(all(test, windows))]
 mod windows_input_bridge_tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::os::windows::io::AsRawHandle;
     use winapi::shared::minwindef::TRUE;
     use winapi::um::wincon::*;
     use winapi::um::winuser;
@@ -2043,6 +2045,65 @@ mod windows_input_bridge_tests {
                 encoder.encode_records(&mut parser, &[record], &state),
                 b"\x1b[O"
             );
+        }
+    }
+
+    mod windows_console_integration {
+        use super::*;
+
+        #[test]
+        #[ignore = "requires an interactive Windows console input buffer"]
+        fn write_console_input_records_are_read_and_encoded_by_bridge_reader() -> anyhow::Result<()>
+        {
+            let mut tty = super::super::win::WinTty::new()?;
+            tty.set_bridge_mode()?;
+
+            let conin = OpenOptions::new().read(true).write(true).open("CONIN$")?;
+            let records = [
+                key_record('A' as u16, 0x1e, 'a', true, 1, 0),
+                mouse_input_record(mouse_record(
+                    0,
+                    0,
+                    FROM_LEFT_1ST_BUTTON_PRESSED,
+                    SHIFT_PRESSED,
+                    0,
+                )),
+                resize_input_record(120, 40),
+            ];
+
+            let mut written = 0;
+            let ok = unsafe {
+                WriteConsoleInputW(
+                    conin.as_raw_handle() as *mut _,
+                    records.as_ptr() as *mut _,
+                    records.len() as u32,
+                    &mut written,
+                )
+            };
+            assert_ne!(ok, 0);
+            assert_eq!(written, records.len() as u32);
+
+            let mut input = tty.input_reader()?;
+            let read = input.read_console_input(records.len())?;
+            assert_eq!(read.len(), records.len());
+            assert_eq!(read[0].EventType, KEY_EVENT);
+            assert_eq!(read[1].EventType, MOUSE_EVENT);
+            assert_eq!(read[2].EventType, WINDOW_BUFFER_SIZE_EVENT);
+
+            let mut encoder = WinInputEncoder::default();
+            let mut parser = termwiz::input::InputParser::new();
+            let state = InnerInputState {
+                mouse_default: true,
+                mouse_tracking: MouseTrackingMode::Default,
+                sgr_mouse: true,
+                ..Default::default()
+            };
+            assert_eq!(
+                encoder.encode_records(&mut parser, &read[..2], &state),
+                b"a\x1b[<4;1;1M"
+            );
+
+            Ok(())
         }
     }
 }
