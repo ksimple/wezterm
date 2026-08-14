@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, RecvTimeoutError};
 #[cfg(windows)]
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -490,6 +490,8 @@ enum Message {
     Stdin(Vec<u8>),
     /// Output from the child tty
     Stdout(Vec<u8>),
+    /// Child tty output reached EOF
+    StdoutEof,
     /// Terminal window size changed
     Resize(PtySize),
     /// Child process terminated
@@ -585,10 +587,16 @@ impl InputModeTracker {
         }
     }
 
+    #[cfg(test)]
     fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.filter_and_get_responses(bytes).0
+    }
+
+    fn filter_and_get_responses(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let mut data = std::mem::take(&mut self.pending);
         data.extend_from_slice(bytes);
         let mut output = Vec::with_capacity(data.len());
+        let mut responses = Vec::new();
 
         let mut i = 0;
         while i < data.len() {
@@ -637,9 +645,12 @@ impl InputModeTracker {
                     }
                     _ => output.extend_from_slice(&data[i..=end]),
                 }
-            } else if Self::owns_terminal_response_query(&data[i + 2..end], final_byte) {
+            } else if let Some(response) =
+                Self::response_for_terminal_query(&data[i + 2..end], final_byte)
+            {
                 // Do not let the outer terminal answer DA/DSR/CPR queries. Those
                 // responses arrive as console input and race with user text.
+                responses.extend_from_slice(response);
             } else {
                 output.extend_from_slice(&data[i..=end]);
             }
@@ -647,7 +658,7 @@ impl InputModeTracker {
             i = end + 1;
         }
 
-        output
+        (output, responses)
     }
 
     fn drain_pending(&mut self) -> Vec<u8> {
@@ -673,14 +684,65 @@ impl InputModeTracker {
         matches!(mode, 1 | 1000 | 1002 | 1003 | 1004 | 1006 | 2004 | 9001)
     }
 
-    fn owns_terminal_response_query(params: &[u8], final_byte: u8) -> bool {
+    fn response_for_terminal_query(params: &[u8], final_byte: u8) -> Option<&'static [u8]> {
         let params = std::str::from_utf8(params).unwrap_or("");
         match final_byte {
-            b'c' => matches!(params, "" | "0" | ">" | ">0"),
-            b'n' => matches!(params, "5" | "6"),
+            b'c' if matches!(params, "" | "0") => Some(b"\x1b[?1;0c"),
+            b'c' if matches!(params, ">" | ">0") => Some(b"\x1b[>0;0;0c"),
+            b'n' if params == "5" => Some(b"\x1b[0n"),
+            b'n' if params == "6" => Some(b"\x1b[1;1R"),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+enum WinInputBatchMessage {
+    Stdin(Vec<u8>),
+    Resize,
+}
+
+#[cfg(all(test, windows))]
+impl PartialEq for WinInputBatchMessage {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Stdin(a), Self::Stdin(b)) => a == b,
+            (Self::Resize, Self::Resize) => true,
             _ => false,
         }
     }
+}
+
+#[cfg(windows)]
+fn encode_win_input_batch(
+    parser: &mut termwiz::input::InputParser,
+    encoder: &mut WinInputEncoder,
+    records: &[winapi::um::wincon::INPUT_RECORD],
+    state: &InnerInputState,
+) -> Vec<WinInputBatchMessage> {
+    let mut messages = Vec::new();
+    let mut pending_input_records = Vec::new();
+
+    for record in records {
+        if record.EventType == winapi::um::wincon::WINDOW_BUFFER_SIZE_EVENT {
+            let data = encoder.encode_records(parser, &pending_input_records, state);
+            pending_input_records.clear();
+            if !data.is_empty() {
+                messages.push(WinInputBatchMessage::Stdin(data));
+            }
+            messages.push(WinInputBatchMessage::Resize);
+        } else {
+            pending_input_records.push(*record);
+        }
+    }
+
+    let data = encoder.encode_records(parser, &pending_input_records, state);
+    if !data.is_empty() {
+        messages.push(WinInputBatchMessage::Stdin(data));
+    }
+
+    messages
 }
 
 #[cfg(windows)]
@@ -816,20 +878,18 @@ impl WinInputEncoder {
         state: &InnerInputState,
     ) -> Option<Vec<u8>> {
         use winapi::um::wincon::*;
+        const PHYSICAL_BUTTONS: u32 =
+            FROM_LEFT_1ST_BUTTON_PRESSED | FROM_LEFT_2ND_BUTTON_PRESSED | RIGHTMOST_BUTTON_PRESSED;
 
         if state.mouse_tracking == MouseTrackingMode::None {
-            self.last_mouse_buttons = mouse.dwButtonState;
+            self.last_mouse_buttons = mouse.dwButtonState & PHYSICAL_BUTTONS;
             return None;
         }
 
         let is_move = (mouse.dwEventFlags & MOUSE_MOVED) != 0;
         let is_wheel = (mouse.dwEventFlags & MOUSE_WHEELED) != 0;
         let is_horizontal_wheel = (mouse.dwEventFlags & MOUSE_HWHEELED) != 0;
-        let physical_button_pressed = mouse.dwButtonState
-            & (FROM_LEFT_1ST_BUTTON_PRESSED
-                | FROM_LEFT_2ND_BUTTON_PRESSED
-                | RIGHTMOST_BUTTON_PRESSED)
-            != 0;
+        let physical_button_pressed = mouse.dwButtonState & PHYSICAL_BUTTONS != 0;
 
         let should_send = match state.mouse_tracking {
             MouseTrackingMode::None => false,
@@ -839,7 +899,7 @@ impl WinInputEncoder {
         };
 
         if !should_send {
-            self.last_mouse_buttons = mouse.dwButtonState;
+            self.last_mouse_buttons = mouse.dwButtonState & PHYSICAL_BUTTONS;
             return None;
         }
 
@@ -896,7 +956,7 @@ impl WinInputEncoder {
             && !is_horizontal_wheel
             && mouse.dwButtonState == 0
             && self.last_mouse_buttons != 0;
-        self.last_mouse_buttons = mouse.dwButtonState;
+        self.last_mouse_buttons = mouse.dwButtonState & PHYSICAL_BUTTONS;
 
         if state.sgr_mouse {
             Some(
@@ -989,6 +1049,17 @@ mod windows_input_bridge_tests {
         record
     }
 
+    fn resize_input_record(cols: i16, rows: i16) -> INPUT_RECORD {
+        let mut resize: WINDOW_BUFFER_SIZE_RECORD = unsafe { std::mem::zeroed() };
+        resize.dwSize = COORD { X: cols, Y: rows };
+        let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+        record.EventType = WINDOW_BUFFER_SIZE_EVENT;
+        unsafe {
+            *record.Event.WindowBufferSizeEvent_mut() = resize;
+        }
+        record
+    }
+
     #[test]
     fn filters_owned_input_modes_and_updates_state() {
         let (state, mut tracker) = tracker();
@@ -1059,7 +1130,27 @@ mod windows_input_bridge_tests {
     fn filters_terminal_response_queries_from_child_output() {
         let (_state, mut tracker) = tracker();
 
-        assert_eq!(tracker.filter(b"a\x1b[c\x1b[>0c\x1b[6n\x1b[5nb"), b"ab");
+        let (output, responses) =
+            tracker.filter_and_get_responses(b"a\x1b[c\x1b[>0c\x1b[6n\x1b[5nb");
+
+        assert_eq!(output, b"ab");
+        assert_eq!(responses, b"\x1b[?1;0c\x1b[>0;0;0c\x1b[1;1R\x1b[0n");
+    }
+
+    #[test]
+    fn filters_fragmented_terminal_response_queries_from_child_output() {
+        let (_state, mut tracker) = tracker();
+
+        assert_eq!(tracker.filter(b"pre\x1b["), b"pre");
+        let (output, responses) = tracker.filter_and_get_responses(b"6npost");
+        assert_eq!(output, b"post");
+        assert_eq!(responses, b"\x1b[1;1R");
+        assert_eq!(tracker.drain_pending(), b"");
+
+        assert_eq!(tracker.filter(b"\x1b[>"), b"");
+        let (output, responses) = tracker.filter_and_get_responses(b"0c");
+        assert_eq!(output, b"");
+        assert_eq!(responses, b"\x1b[>0;0;0c");
     }
 
     #[test]
@@ -1187,6 +1278,30 @@ mod windows_input_bridge_tests {
     }
 
     #[test]
+    fn esc_prefixed_response_like_text_is_not_swallowed() {
+        let mut encoder = WinInputEncoder::default();
+        let mut parser = termwiz::input::InputParser::new();
+        let first = [
+            key_record(winuser::VK_ESCAPE as u16, 1, '\x1b', true, 1, 0),
+            key_record('[' as u16, 0, '[', true, 1, 0),
+            key_record('6' as u16, 0, '6', true, 1, 0),
+        ];
+        let second = [
+            key_record('n' as u16, 0, 'n', true, 1, 0),
+            key_record('a' as u16, 0x1e, 'a', true, 1, 0),
+        ];
+
+        assert_eq!(
+            encoder.encode_records(&mut parser, &first, &InnerInputState::default()),
+            b"\x1b[6"
+        );
+        assert_eq!(
+            encoder.encode_records(&mut parser, &second, &InnerInputState::default()),
+            b"na"
+        );
+    }
+
+    #[test]
     fn response_like_text_is_encoded_in_win32_mode() {
         let mut encoder = WinInputEncoder::default();
         let mut parser = termwiz::input::InputParser::new();
@@ -1291,6 +1406,28 @@ mod windows_input_bridge_tests {
     }
 
     #[test]
+    fn wheel_delta_does_not_create_later_button_release() {
+        let mut encoder = WinInputEncoder::default();
+        let state = InnerInputState {
+            mouse_default: true,
+            mouse_tracking: MouseTrackingMode::Default,
+            sgr_mouse: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            encoder
+                .encode_mouse(&mouse_record(0, 0, 120u32 << 16, 0, MOUSE_WHEELED), &state)
+                .unwrap(),
+            b"\x1b[<64;1;1M"
+        );
+        assert_eq!(
+            encoder.encode_mouse(&mouse_record(0, 0, 0, 0, 0), &state),
+            Some(b"\x1b[<3;1;1M".to_vec())
+        );
+    }
+
+    #[test]
     fn mouse_tracking_modes_gate_motion_events() {
         let hover = mouse_record(0, 0, 0, 0, MOUSE_MOVED);
         let drag = mouse_record(0, 0, FROM_LEFT_1ST_BUTTON_PRESSED, 0, MOUSE_MOVED);
@@ -1351,6 +1488,53 @@ mod windows_input_bridge_tests {
         assert_eq!(
             encoder.encode_records(&mut parser, &records, &state),
             b"\x1b[<0;1;1M\x1b[<0;1;1m"
+        );
+    }
+
+    #[test]
+    fn tracked_mouse_modes_drive_encoded_mouse_records() {
+        let (state, mut tracker) = tracker();
+        assert_eq!(tracker.filter(b"\x1b[?1000;1006h"), b"");
+
+        let mut encoder = WinInputEncoder::default();
+        let mut parser = termwiz::input::InputParser::new();
+        let mouse = mouse_input_record(mouse_record(0, 0, FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0));
+        let state_snapshot = state.lock().unwrap().clone();
+        assert_eq!(
+            encoder.encode_records(&mut parser, &[mouse], &state_snapshot),
+            b"\x1b[<0;1;1M"
+        );
+
+        assert_eq!(tracker.filter(b"\x1b[?1000l"), b"");
+        let state_snapshot = state.lock().unwrap().clone();
+        assert_eq!(
+            encoder.encode_records(&mut parser, &[mouse], &state_snapshot),
+            b""
+        );
+    }
+
+    #[test]
+    fn win_input_batch_preserves_resize_order() {
+        let mut encoder = WinInputEncoder::default();
+        let mut parser = termwiz::input::InputParser::new();
+        let records = [
+            key_record('A' as u16, 0x1e, 'a', true, 1, 0),
+            resize_input_record(120, 40),
+            key_record('B' as u16, 0x30, 'b', true, 1, 0),
+        ];
+
+        assert_eq!(
+            encode_win_input_batch(
+                &mut parser,
+                &mut encoder,
+                &records,
+                &InnerInputState::default()
+            ),
+            vec![
+                WinInputBatchMessage::Stdin(b"a".to_vec()),
+                WinInputBatchMessage::Resize,
+                WinInputBatchMessage::Stdin(b"b".to_vec()),
+            ]
         );
     }
 
@@ -1559,6 +1743,7 @@ impl RecordCommand {
                     }
                     tx.send(Message::Stdout(buf[0..size].to_vec()))?;
                 }
+                tx.send(Message::StdoutEof)?;
                 Ok(())
             });
         }
@@ -1574,23 +1759,17 @@ impl RecordCommand {
                 loop {
                     let records = input.read_console_input(128)?;
                     let state = state.lock().map(|state| state.clone()).unwrap_or_default();
-                    let mut pending_input_records = Vec::new();
-                    for record in &records {
-                        if record.EventType == winapi::um::wincon::WINDOW_BUFFER_SIZE_EVENT {
-                            let data =
-                                encoder.encode_records(&mut parser, &pending_input_records, &state);
-                            pending_input_records.clear();
-                            if !data.is_empty() {
+                    for message in
+                        encode_win_input_batch(&mut parser, &mut encoder, &records, &state)
+                    {
+                        match message {
+                            WinInputBatchMessage::Stdin(data) => {
                                 tx.send(Message::Stdin(data))?;
                             }
-                            tx.send(Message::Resize(input.get_size()?))?;
-                        } else {
-                            pending_input_records.push(*record);
+                            WinInputBatchMessage::Resize => {
+                                tx.send(Message::Resize(input.get_size()?))?;
+                            }
                         }
-                    }
-                    let data = encoder.encode_records(&mut parser, &pending_input_records, &state);
-                    if !data.is_empty() {
-                        tx.send(Message::Stdin(data))?;
                     }
                 }
             });
@@ -1643,8 +1822,24 @@ impl RecordCommand {
         let first_output = Instant::now();
         let mut buffer = vec![];
         let mut writer = pair.master.take_writer()?;
+        let mut stdout_eof = false;
+        let mut child_terminated_at = None;
 
-        for msg in rx {
+        loop {
+            let msg = if child_status.is_some() && !stdout_eof {
+                let deadline =
+                    child_terminated_at.unwrap_or_else(Instant::now) + Duration::from_millis(500);
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(msg) => msg,
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match rx.recv() {
+                    Ok(msg) => msg,
+                    Err(_) => break,
+                }
+            };
+
             match msg {
                 Message::Stdin(data) => {
                     writer.write_all(&data)?;
@@ -1653,7 +1848,11 @@ impl RecordCommand {
                     let elapsed = first_output.elapsed().as_secs_f32();
                     #[cfg(windows)]
                     if let Some(tracker) = input_mode_tracker.as_mut() {
-                        data = tracker.filter(&data);
+                        let (filtered, responses) = tracker.filter_and_get_responses(&data);
+                        if !responses.is_empty() {
+                            writer.write_all(&responses)?;
+                        }
+                        data = filtered;
                     }
                     if data.is_empty() {
                         continue;
@@ -1661,22 +1860,50 @@ impl RecordCommand {
                     tty.write_all(&data)?;
                     log_utf8_output(&mut cast_file, &mut buffer, elapsed, &mut data)?;
                 }
+                Message::StdoutEof => {
+                    stdout_eof = true;
+                    if child_status.is_some() {
+                        #[cfg(windows)]
+                        if let Some(tracker) = input_mode_tracker.as_mut() {
+                            let mut data = tracker.drain_pending();
+                            if !data.is_empty() {
+                                let elapsed = first_output.elapsed().as_secs_f32();
+                                tty.write_all(&data)?;
+                                log_utf8_output(&mut cast_file, &mut buffer, elapsed, &mut data)?;
+                            }
+                        }
+                        break;
+                    }
+                }
                 Message::Resize(size) => {
                     pair.master.resize(size)?;
                 }
                 Message::Terminated(status) => {
-                    #[cfg(windows)]
-                    if let Some(tracker) = input_mode_tracker.as_mut() {
-                        let mut data = tracker.drain_pending();
-                        if !data.is_empty() {
-                            let elapsed = first_output.elapsed().as_secs_f32();
-                            tty.write_all(&data)?;
-                            log_utf8_output(&mut cast_file, &mut buffer, elapsed, &mut data)?;
-                        }
-                    }
                     child_status.replace(status);
-                    break;
+                    child_terminated_at = Some(Instant::now());
+                    if stdout_eof {
+                        #[cfg(windows)]
+                        if let Some(tracker) = input_mode_tracker.as_mut() {
+                            let mut data = tracker.drain_pending();
+                            if !data.is_empty() {
+                                let elapsed = first_output.elapsed().as_secs_f32();
+                                tty.write_all(&data)?;
+                                log_utf8_output(&mut cast_file, &mut buffer, elapsed, &mut data)?;
+                            }
+                        }
+                        break;
+                    }
                 }
+            }
+        }
+
+        #[cfg(windows)]
+        if let Some(tracker) = input_mode_tracker.as_mut() {
+            let mut data = tracker.drain_pending();
+            if !data.is_empty() {
+                let elapsed = first_output.elapsed().as_secs_f32();
+                tty.write_all(&data)?;
+                log_utf8_output(&mut cast_file, &mut buffer, elapsed, &mut data)?;
             }
         }
 
