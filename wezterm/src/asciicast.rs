@@ -1165,6 +1165,23 @@ mod windows_input_bridge_tests {
         record
     }
 
+    fn focus_input_record(focused: bool) -> INPUT_RECORD {
+        let mut focus: FOCUS_EVENT_RECORD = unsafe { std::mem::zeroed() };
+        focus.bSetFocus = if focused { TRUE } else { 0 };
+        let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+        record.EventType = FOCUS_EVENT;
+        unsafe {
+            *record.Event.FocusEvent_mut() = focus;
+        }
+        record
+    }
+
+    fn menu_input_record() -> INPUT_RECORD {
+        let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+        record.EventType = MENU_EVENT;
+        record
+    }
+
     fn encode_records_with_state(records: &[INPUT_RECORD], state: &InnerInputState) -> Vec<u8> {
         let mut encoder = WinInputEncoder::default();
         let mut parser = termwiz::input::InputParser::new();
@@ -1377,6 +1394,62 @@ mod windows_input_bridge_tests {
         }
 
         #[test]
+        fn dec_private_modes_work_when_split_at_every_byte() {
+            for (sequence, expected_output, assert_state) in [
+                (
+                    b"\x1b[?9001h".as_slice(),
+                    b"".as_slice(),
+                    Box::new(|state: &InnerInputState| assert!(state.win32_input))
+                        as Box<dyn Fn(&InnerInputState)>,
+                ),
+                (
+                    b"\x1b[?25;1000;1006h".as_slice(),
+                    b"\x1b[?25h".as_slice(),
+                    Box::new(|state: &InnerInputState| {
+                        assert_eq!(state.mouse_tracking, MouseTrackingMode::Default);
+                        assert!(state.sgr_mouse);
+                    }),
+                ),
+                (
+                    b"\x1b[?1000;1006;2004l".as_slice(),
+                    b"".as_slice(),
+                    Box::new(|state: &InnerInputState| {
+                        assert_eq!(state.mouse_tracking, MouseTrackingMode::None);
+                        assert!(!state.sgr_mouse);
+                        assert!(!state.bracketed_paste);
+                    }),
+                ),
+            ] {
+                let (state, mut tracker) = tracker();
+                let mut output = Vec::new();
+                for byte in sequence {
+                    output.extend_from_slice(&tracker.filter(&[*byte]));
+                }
+
+                assert_eq!(output, expected_output);
+                assert_eq!(tracker.drain_pending(), b"");
+                assert_state(&state.lock().unwrap());
+            }
+        }
+
+        #[test]
+        fn malformed_dec_private_mode_is_preserved_when_split_at_every_byte() {
+            let (state, mut tracker) = tracker();
+            let sequence = b"\x1b[?1000:1h";
+            let mut output = Vec::new();
+
+            for byte in sequence {
+                output.extend_from_slice(&tracker.filter(&[*byte]));
+            }
+
+            assert_eq!(output, sequence);
+            assert_eq!(
+                state.lock().unwrap().mouse_tracking,
+                MouseTrackingMode::None
+            );
+        }
+
+        #[test]
         fn preserves_fragmented_unowned_mode_sequence() {
             let (_state, mut tracker) = tracker();
 
@@ -1549,6 +1622,68 @@ mod windows_input_bridge_tests {
         }
 
         #[test]
+        fn control_strings_preserve_csi_like_payloads_and_st_terminators() {
+            for (sequence, split_at) in [
+                (b"\x1b]0;osc \x1b[6n \x1b[?9001h\x1b\\after".as_slice(), 9),
+                (b"\x1b_apc \x1b[6n \x1b[?1000h\x1b\\after", 12),
+                (b"\x1b^pm \x1b[5n \x1b[?2004h\x1b\\after", 15),
+                (b"\x1bXsos \x1b[c \x1b[?1006h\x1b\\after", 18),
+            ] {
+                let (state, mut tracker) = tracker();
+
+                assert_eq!(tracker.filter(&sequence[..split_at]), b"");
+                let (output, responses) = tracker.filter_and_get_responses(&sequence[split_at..]);
+
+                assert_eq!(output, sequence);
+                assert_eq!(responses, b"");
+                let state = state.lock().unwrap();
+                assert!(!state.win32_input);
+                assert_eq!(state.mouse_tracking, MouseTrackingMode::None);
+                assert!(!state.bracketed_paste);
+            }
+        }
+
+        #[test]
+        fn split_control_string_st_terminator_is_preserved() {
+            let (_state, mut tracker) = tracker();
+
+            assert_eq!(tracker.filter(b"\x1b]0;title\x1b"), b"");
+            assert_eq!(tracker.filter(b"\\tail"), b"\x1b]0;title\x1b\\tail");
+        }
+
+        #[test]
+        fn c1_csi_and_st_bytes_are_passed_through_without_state_changes() {
+            let (state, mut tracker) = tracker();
+            let c1 = b"\x9b?9001htext\x9c";
+
+            let (output, responses) = tracker.filter_and_get_responses(c1);
+
+            assert_eq!(output, c1);
+            assert_eq!(responses, b"");
+            assert!(!state.lock().unwrap().win32_input);
+        }
+
+        #[test]
+        fn query_responses_are_written_before_later_user_input() {
+            let (_state, mut tracker) = tracker();
+            let mut child_input = Vec::new();
+
+            assert_eq!(
+                filter_child_output_for_outer_terminal(&mut tracker, b"\x1b[6n", &mut child_input)
+                    .unwrap(),
+                b""
+            );
+            child_input.extend_from_slice(b"user");
+            assert_eq!(
+                filter_child_output_for_outer_terminal(&mut tracker, b"\x1b[5n", &mut child_input)
+                    .unwrap(),
+                b""
+            );
+
+            assert_eq!(child_input, b"\x1b[1;1Ruser\x1b[0n");
+        }
+
+        #[test]
         fn stdout_drain_timeout_only_applies_after_child_exit_before_stdout_eof() {
             let now = Instant::now();
 
@@ -1678,6 +1813,23 @@ mod windows_input_bridge_tests {
         }
 
         #[test]
+        fn win32_input_preserves_key_control_state() {
+            let control_state =
+                SHIFT_PRESSED | RIGHT_CTRL_PRESSED | LEFT_ALT_PRESSED | ENHANCED_KEY;
+            let a = key_record('A' as u16, 0x1e, 'a', true, 1, control_state);
+            let a_up = key_record('A' as u16, 0x1e, 'a', false, 1, control_state);
+
+            assert_eq!(
+                encode_records_with_state(&[a, a_up], &win32_state()),
+                [
+                    expected_win32_key(65, 30, 97, true, control_state, 1),
+                    expected_win32_key(65, 30, 97, false, control_state, 1),
+                ]
+                .concat()
+            );
+        }
+
+        #[test]
         fn key_up_is_ignored_in_plain_mode_and_encoded_in_win32_mode() {
             let a_up = key_record('A' as u16, 0x1e, 'a', false, 1, 0);
 
@@ -1694,6 +1846,23 @@ mod windows_input_bridge_tests {
             let up = key_record(winuser::VK_UP as u16, 0x48, '\0', true, 3, 0);
 
             assert_eq!(encode_records_default(&[up]), b"\x1b[A\x1b[A\x1b[A");
+        }
+
+        #[test]
+        fn modified_non_printable_keys_encode_xterm_modifiers() {
+            let shifted_tab =
+                key_record(winuser::VK_TAB as u16, 0x0f, '\0', true, 1, SHIFT_PRESSED);
+            let ctrl_left = key_record(
+                winuser::VK_LEFT as u16,
+                0x4b,
+                '\0',
+                true,
+                1,
+                LEFT_CTRL_PRESSED,
+            );
+
+            assert_eq!(encode_records_default(&[shifted_tab]), b"\x1b[Z");
+            assert_eq!(encode_records_default(&[ctrl_left]), b"\x1b[1;5D");
         }
 
         #[test]
@@ -1949,6 +2118,31 @@ mod windows_input_bridge_tests {
                 b"a"
             );
         }
+
+        #[test]
+        fn x_mouse_buttons_do_not_create_tracked_button_state() {
+            let mut encoder = WinInputEncoder::default();
+            let state = sgr_mouse_state(MouseTrackingMode::Default);
+
+            assert_eq!(
+                encoder.encode_mouse(
+                    &mouse_record(0, 0, FROM_LEFT_3RD_BUTTON_PRESSED, 0, 0),
+                    &state
+                ),
+                None
+            );
+            assert_eq!(
+                encoder.encode_mouse(
+                    &mouse_record(0, 0, FROM_LEFT_4TH_BUTTON_PRESSED, 0, 0),
+                    &state
+                ),
+                None
+            );
+            assert_eq!(
+                encoder.encode_mouse(&mouse_record(0, 0, 0, 0, 0), &state),
+                None
+            );
+        }
     }
 
     mod batching {
@@ -1975,6 +2169,64 @@ mod windows_input_bridge_tests {
                     WinInputBatchMessage::Stdin(b"a".to_vec()),
                     WinInputBatchMessage::Resize,
                     WinInputBatchMessage::Stdin(b"b".to_vec()),
+                ]
+            );
+        }
+
+        #[test]
+        fn win_input_batch_handles_resize_only_and_adjacent_resizes() {
+            let mut encoder = WinInputEncoder::default();
+            let mut parser = termwiz::input::InputParser::new();
+            let records = [
+                resize_input_record(100, 30),
+                resize_input_record(120, 40),
+                key_record('A' as u16, 0x1e, 'a', true, 1, 0),
+                resize_input_record(80, 25),
+            ];
+
+            assert_eq!(
+                encode_win_input_batch(
+                    &mut parser,
+                    &mut encoder,
+                    &records,
+                    &InnerInputState::default()
+                ),
+                vec![
+                    WinInputBatchMessage::Resize,
+                    WinInputBatchMessage::Resize,
+                    WinInputBatchMessage::Stdin(b"a".to_vec()),
+                    WinInputBatchMessage::Resize,
+                ]
+            );
+        }
+
+        #[test]
+        fn win_input_batch_preserves_focus_resize_mouse_order() {
+            let mut encoder = WinInputEncoder::default();
+            let mut parser = termwiz::input::InputParser::new();
+            let state = InnerInputState {
+                focus: true,
+                mouse_default: true,
+                mouse_tracking: MouseTrackingMode::Default,
+                sgr_mouse: true,
+                ..Default::default()
+            };
+            let records = [
+                focus_input_record(true),
+                resize_input_record(120, 40),
+                mouse_input_record(mouse_record(0, 0, FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0)),
+                resize_input_record(100, 30),
+                focus_input_record(false),
+            ];
+
+            assert_eq!(
+                encode_win_input_batch(&mut parser, &mut encoder, &records, &state),
+                vec![
+                    WinInputBatchMessage::Stdin(b"\x1b[I".to_vec()),
+                    WinInputBatchMessage::Resize,
+                    WinInputBatchMessage::Stdin(b"\x1b[<0;1;1M".to_vec()),
+                    WinInputBatchMessage::Resize,
+                    WinInputBatchMessage::Stdin(b"\x1b[O".to_vec()),
                 ]
             );
         }
@@ -2192,12 +2444,41 @@ mod windows_input_bridge_tests {
                 b"\x1b[O"
             );
         }
+
+        #[test]
+        fn menu_events_are_ignored_without_disturbing_key_order() {
+            let records = [
+                key_record('A' as u16, 0x1e, 'a', true, 1, 0),
+                menu_input_record(),
+                key_record('B' as u16, 0x30, 'b', true, 1, 0),
+            ];
+
+            assert_eq!(encode_records_default(&records), b"ab");
+        }
     }
 
     mod windows_console_integration {
         use super::*;
         use std::path::PathBuf;
         use std::process::Command;
+        use std::time::Duration;
+
+        fn require_wezterm_pane_for_record_e2e() -> anyhow::Result<bool> {
+            if std::env::var_os("WEZTERM_PANE").is_some() {
+                return Ok(true);
+            }
+
+            if std::env::var_os("WEZTERM_RECORD_E2E_REQUIRED").is_some() {
+                anyhow::bail!(
+                    "wezterm record e2e requires WEZTERM_PANE; unset WEZTERM_RECORD_E2E_REQUIRED to skip outside a real pane"
+                );
+            }
+
+            eprintln!(
+                "skipping: this e2e requires a real WezTerm pane; set WEZTERM_RECORD_E2E_REQUIRED=1 to make missing prerequisites fail"
+            );
+            Ok(false)
+        }
 
         fn debug_wezterm_exe() -> PathBuf {
             let mut path = std::env::current_exe().unwrap();
@@ -2320,8 +2601,7 @@ mod windows_input_bridge_tests {
         #[test]
         #[ignore = "spawns wezterm record and requires an interactive Windows console"]
         fn wezterm_record_win_input_on_filters_owned_modes_in_cast() -> anyhow::Result<()> {
-            if std::env::var_os("WEZTERM_PANE").is_none() {
-                eprintln!("skipping: this e2e requires a real WezTerm pane");
+            if !require_wezterm_pane_for_record_e2e()? {
                 return Ok(());
             }
 
@@ -2360,6 +2640,96 @@ mod windows_input_bridge_tests {
             assert!(!payload.contains("\x1b[?1006l"));
             assert!(payload.contains("\x1b[?25h"));
             assert!(payload.contains("\x1b[?25l"));
+
+            Ok(())
+        }
+
+        #[test]
+        #[ignore = "spawns wezterm record and injects interactive Windows console input"]
+        fn wezterm_record_win_input_on_forwards_console_input_to_child() -> anyhow::Result<()> {
+            if !require_wezterm_pane_for_record_e2e()? {
+                return Ok(());
+            }
+
+            let cast = tempfile::Builder::new()
+                .prefix("wezterm-record-win-input-forward-e2e-")
+                .suffix(".cast.txt")
+                .tempfile()?
+                .into_temp_path();
+            let cast_path = cast.to_path_buf();
+            let script = r#"
+$e=[char]27
+[Console]::Out.Write("${e}[?9001hINPUT_E2E_READY`r`n")
+$stdin=[Console]::OpenStandardInput()
+$buf=New-Object byte[] 128
+$task=$stdin.ReadAsync($buf, 0, $buf.Length)
+if (-not $task.Wait(10000)) {
+  [Console]::Out.Write("INPUT_E2E_TIMEOUT`r`n")
+  [Console]::Out.Write("${e}[?9001l")
+  exit 2
+}
+$n=$task.Result
+$hex=($buf[0..($n - 1)] | ForEach-Object { $_.ToString('X2') }) -join ''
+[Console]::Out.Write("INPUT_E2E_HEX=$hex`r`n${e}[?9001l")
+"#;
+
+            let conin = OpenOptions::new().read(true).write(true).open("CONIN$")?;
+            let conin_handle = conin.as_raw_handle() as *mut _;
+            assert_ne!(unsafe { FlushConsoleInputBuffer(conin_handle) }, 0);
+
+            let mut child = Command::new(debug_wezterm_exe())
+                .arg("record")
+                .arg("--win-input=on")
+                .arg("-o")
+                .arg(&cast_path)
+                .arg("--")
+                .arg("powershell.exe")
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-Command")
+                .arg(script)
+                .spawn()?;
+
+            // The cast file is finalized by `wezterm record` on exit, so it is
+            // not a reliable readiness signal while the child is still running.
+            // Give the recorder and child a moment to request Win32 input, then
+            // flush any typed test-command keys before injecting the sentinel.
+            std::thread::sleep(Duration::from_millis(4000));
+            assert_ne!(unsafe { FlushConsoleInputBuffer(conin_handle) }, 0);
+
+            let input = [
+                key_record('A' as u16, 0x1e, 'a', true, 1, 0),
+                key_record(winuser::VK_RETURN as u16, 0x1c, '\r', true, 1, 0),
+            ];
+            let mut written = 0;
+            let ok = unsafe {
+                WriteConsoleInputW(
+                    conin_handle,
+                    input.as_ptr() as *mut _,
+                    input.len() as u32,
+                    &mut written,
+                )
+            };
+            assert_ne!(ok, 0);
+            assert_eq!(written, input.len() as u32);
+
+            let status = child.wait()?;
+            assert!(
+                status.success(),
+                "wezterm record failed: status={:?}",
+                status.code()
+            );
+
+            let payload = cast_payload(&cast_path)?;
+            assert!(payload.contains("INPUT_E2E_READY"));
+            assert!(
+                payload.contains("INPUT_E2E_HEX=610D0A"),
+                "payload did not include expected input bytes: {:?}",
+                payload
+            );
+            assert!(!payload.contains("\x1b[?9001h"));
+            assert!(!payload.contains("\x1b[?9001l"));
+            assert_ne!(unsafe { FlushConsoleInputBuffer(conin_handle) }, 0);
 
             Ok(())
         }
