@@ -699,6 +699,19 @@ impl InputModeTracker {
 }
 
 #[cfg(windows)]
+fn filter_child_output_for_outer_terminal(
+    tracker: &mut InputModeTracker,
+    data: &[u8],
+    child_input: &mut impl Write,
+) -> std::io::Result<Vec<u8>> {
+    let (filtered, responses) = tracker.filter_and_get_responses(data);
+    if !responses.is_empty() {
+        child_input.write_all(&responses)?;
+    }
+    Ok(filtered)
+}
+
+#[cfg(windows)]
 #[derive(Debug)]
 enum WinInputBatchMessage {
     Stdin(Vec<u8>),
@@ -1284,6 +1297,66 @@ mod windows_input_bridge_tests {
                 assert_eq!(tracker.drain_pending(), b"");
             }
         }
+    }
+
+    #[test]
+    fn child_output_filter_writes_query_responses_without_outer_output() {
+        let (_state, mut tracker) = tracker();
+        let mut child_input = Vec::new();
+
+        let output = filter_child_output_for_outer_terminal(
+            &mut tracker,
+            b"before\x1b[c\x1b[5n\x1b[6nafter",
+            &mut child_input,
+        )
+        .unwrap();
+
+        assert_eq!(output, b"beforeafter");
+        assert_eq!(child_input, b"\x1b[?1;0c\x1b[0n\x1b[1;1R");
+    }
+
+    #[test]
+    fn child_output_filter_keeps_markers_and_unowned_modes_out_of_child_input() {
+        let (state, mut tracker) = tracker();
+        let mut child_input = Vec::new();
+
+        let output = filter_child_output_for_outer_terminal(
+            &mut tracker,
+            b"start\x1b[?9001h\x1b[?25;1006hMARK\x1b[?25;1006lend",
+            &mut child_input,
+        )
+        .unwrap();
+
+        assert_eq!(output, b"start\x1b[?25hMARK\x1b[?25lend");
+        assert_eq!(child_input, b"");
+        let state = state.lock().unwrap();
+        assert!(state.win32_input);
+        assert!(!state.sgr_mouse);
+    }
+
+    #[test]
+    fn child_output_filter_handles_fragmented_query_and_mode_sequences() {
+        let (state, mut tracker) = tracker();
+        let mut child_input = Vec::new();
+
+        assert_eq!(
+            filter_child_output_for_outer_terminal(&mut tracker, b"A\x1b[?", &mut child_input)
+                .unwrap(),
+            b"A"
+        );
+        assert_eq!(
+            filter_child_output_for_outer_terminal(&mut tracker, b"9001hB\x1b[", &mut child_input)
+                .unwrap(),
+            b"B"
+        );
+        assert_eq!(
+            filter_child_output_for_outer_terminal(&mut tracker, b"6nC", &mut child_input).unwrap(),
+            b"C"
+        );
+
+        assert_eq!(child_input, b"\x1b[1;1R");
+        assert!(state.lock().unwrap().win32_input);
+        assert_eq!(tracker.drain_pending(), b"");
     }
 
     #[test]
@@ -2120,11 +2193,7 @@ impl RecordCommand {
                     let elapsed = first_output.elapsed().as_secs_f32();
                     #[cfg(windows)]
                     if let Some(tracker) = input_mode_tracker.as_mut() {
-                        let (filtered, responses) = tracker.filter_and_get_responses(&data);
-                        if !responses.is_empty() {
-                            writer.write_all(&responses)?;
-                        }
-                        data = filtered;
+                        data = filter_child_output_for_outer_terminal(tracker, &data, &mut writer)?;
                     }
                     if data.is_empty() {
                         continue;
