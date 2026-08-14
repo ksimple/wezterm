@@ -2196,6 +2196,35 @@ mod windows_input_bridge_tests {
 
     mod windows_console_integration {
         use super::*;
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        fn debug_wezterm_exe() -> PathBuf {
+            let mut path = std::env::current_exe().unwrap();
+            while let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+                if file_name == "deps" {
+                    path.pop();
+                    path.push("wezterm.exe");
+                    return path;
+                }
+                if !path.pop() {
+                    break;
+                }
+            }
+            panic!("could not locate target debug wezterm.exe from current test executable");
+        }
+
+        fn cast_payload(path: &std::path::Path) -> anyhow::Result<String> {
+            let contents = std::fs::read_to_string(path)?;
+            let mut payload = String::new();
+            for line in contents.lines().skip(1).filter(|line| !line.is_empty()) {
+                let event: Event = serde_json::from_str(line)?;
+                if event.1 == "o" {
+                    payload.push_str(&event.2);
+                }
+            }
+            Ok(payload)
+        }
 
         #[test]
         #[ignore = "requires an interactive Windows console input buffer"]
@@ -2284,6 +2313,53 @@ mod windows_input_bridge_tests {
             );
             assert_eq!(restored_mode, original_mode);
             assert_ne!(unsafe { FlushConsoleInputBuffer(conin_handle) }, 0);
+
+            Ok(())
+        }
+
+        #[test]
+        #[ignore = "spawns wezterm record and requires an interactive Windows console"]
+        fn wezterm_record_win_input_on_filters_owned_modes_in_cast() -> anyhow::Result<()> {
+            if std::env::var_os("WEZTERM_PANE").is_none() {
+                eprintln!("skipping: this e2e requires a real WezTerm pane");
+                return Ok(());
+            }
+
+            let cast = tempfile::Builder::new()
+                .prefix("wezterm-record-win-input-e2e-")
+                .suffix(".cast.txt")
+                .tempfile()?
+                .into_temp_path();
+            let cast_path = cast.to_path_buf();
+            let script = "$e=[char]27; [Console]::Out.Write(\"${e}[?9001h${e}[?1006h${e}[?25hE2E_CAST_MARK${e}[?25l${e}[?1006l${e}[?9001l`r`n\")";
+
+            let status = Command::new(debug_wezterm_exe())
+                .arg("record")
+                .arg("--win-input=on")
+                .arg("-o")
+                .arg(&cast_path)
+                .arg("--")
+                .arg("powershell.exe")
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-Command")
+                .arg(script)
+                .status()?;
+
+            assert!(
+                status.success(),
+                "wezterm record failed: status={:?}",
+                status.code()
+            );
+
+            let payload = cast_payload(&cast_path)?;
+            assert!(payload.contains("E2E_CAST_MARK"));
+            assert!(!payload.contains("\x1b[?9001h"));
+            assert!(!payload.contains("\x1b[?9001l"));
+            assert!(!payload.contains("\x1b[?1006h"));
+            assert!(!payload.contains("\x1b[?1006l"));
+            assert!(payload.contains("\x1b[?25h"));
+            assert!(payload.contains("\x1b[?25l"));
 
             Ok(())
         }
