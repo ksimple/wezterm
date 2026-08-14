@@ -529,6 +529,39 @@ enum WinInputMode {
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsInputBridgeAction {
+    SetRaw,
+    SetBridgeMode,
+}
+
+#[cfg(windows)]
+fn configure_windows_input_bridge(
+    win_input: WinInputMode,
+    mut configure: impl FnMut(WindowsInputBridgeAction) -> anyhow::Result<()>,
+    mut warn: impl FnMut(&anyhow::Error),
+) -> anyhow::Result<bool> {
+    match win_input {
+        WinInputMode::Off => {
+            configure(WindowsInputBridgeAction::SetRaw)?;
+            Ok(false)
+        }
+        WinInputMode::Auto => match configure(WindowsInputBridgeAction::SetBridgeMode) {
+            Ok(()) => Ok(true),
+            Err(err) => {
+                warn(&err);
+                configure(WindowsInputBridgeAction::SetRaw)?;
+                Ok(false)
+            }
+        },
+        WinInputMode::On => {
+            configure(WindowsInputBridgeAction::SetBridgeMode)?;
+            Ok(true)
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MouseTrackingMode {
     None,
     Default,
@@ -1241,6 +1274,93 @@ mod windows_input_bridge_tests {
             if key_down { 1 } else { 0 }
         )
         .into_bytes()
+    }
+
+    mod cli_flags {
+        use super::*;
+        use std::cell::Cell;
+
+        fn configure_with_counts(
+            mode: WinInputMode,
+            bridge_fails: bool,
+        ) -> anyhow::Result<(bool, u32, u32, u32)> {
+            let raw_calls = Cell::new(0);
+            let bridge_calls = Cell::new(0);
+            let warnings = Cell::new(0);
+
+            let enabled = configure_windows_input_bridge(
+                mode,
+                |action| {
+                    match action {
+                        WindowsInputBridgeAction::SetRaw => {
+                            raw_calls.set(raw_calls.get() + 1);
+                        }
+                        WindowsInputBridgeAction::SetBridgeMode => {
+                            bridge_calls.set(bridge_calls.get() + 1);
+                            if bridge_fails {
+                                anyhow::bail!("bridge setup failed");
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+                |_| warnings.set(warnings.get() + 1),
+            )?;
+
+            Ok((enabled, raw_calls.get(), bridge_calls.get(), warnings.get()))
+        }
+
+        #[test]
+        fn off_uses_legacy_raw_input_without_trying_bridge() {
+            assert_eq!(
+                configure_with_counts(WinInputMode::Off, true).unwrap(),
+                (false, 1, 0, 0)
+            );
+        }
+
+        #[test]
+        fn auto_uses_bridge_when_setup_succeeds() {
+            assert_eq!(
+                configure_with_counts(WinInputMode::Auto, false).unwrap(),
+                (true, 0, 1, 0)
+            );
+        }
+
+        #[test]
+        fn auto_warns_and_falls_back_to_raw_when_bridge_setup_fails() {
+            assert_eq!(
+                configure_with_counts(WinInputMode::Auto, true).unwrap(),
+                (false, 1, 1, 1)
+            );
+        }
+
+        #[test]
+        fn on_requires_bridge_setup_and_does_not_fall_back() {
+            let raw_calls = Cell::new(0);
+            let bridge_calls = Cell::new(0);
+            let warnings = Cell::new(0);
+
+            let err = configure_windows_input_bridge(
+                WinInputMode::On,
+                |action| match action {
+                    WindowsInputBridgeAction::SetRaw => {
+                        raw_calls.set(raw_calls.get() + 1);
+                        Ok(())
+                    }
+                    WindowsInputBridgeAction::SetBridgeMode => {
+                        bridge_calls.set(bridge_calls.get() + 1);
+                        anyhow::bail!("bridge setup failed")
+                    }
+                },
+                |_| warnings.set(warnings.get() + 1),
+            )
+            .unwrap_err();
+
+            assert_eq!(err.to_string(), "bridge setup failed");
+            assert_eq!(raw_calls.get(), 0);
+            assert_eq!(bridge_calls.get(), 1);
+            assert_eq!(warnings.get(), 0);
+        }
     }
 
     mod tracker_and_run_loop {
@@ -2806,26 +2926,18 @@ impl RecordCommand {
         let mut child_output = pair.master.try_clone_reader()?;
 
         #[cfg(windows)]
-        let use_win_input_bridge = match self.win_input {
-            WinInputMode::Off => {
-                tty.set_raw()?;
-                false
-            }
-            WinInputMode::Auto => match tty.set_bridge_mode() {
-                Ok(()) => true,
-                Err(err) => {
-                    eprintln!(
-                        "warning: failed to initialize Windows input bridge: {err:#}; falling back to legacy input forwarding"
-                    );
-                    tty.set_raw()?;
-                    false
-                }
+        let use_win_input_bridge = configure_windows_input_bridge(
+            self.win_input,
+            |action| match action {
+                WindowsInputBridgeAction::SetRaw => tty.set_raw(),
+                WindowsInputBridgeAction::SetBridgeMode => tty.set_bridge_mode(),
             },
-            WinInputMode::On => {
-                tty.set_bridge_mode()?;
-                true
-            }
-        };
+            |err| {
+                eprintln!(
+                    "warning: failed to initialize Windows input bridge: {err:#}; falling back to legacy input forwarding"
+                );
+            },
+        )?;
         #[cfg(windows)]
         if use_win_input_bridge {
             let _ = tty.reset_outer_input_modes();
