@@ -1072,6 +1072,7 @@ mod windows_input_bridge_tests {
     use std::fs::OpenOptions;
     use std::os::windows::io::AsRawHandle;
     use winapi::shared::minwindef::TRUE;
+    use winapi::um::consoleapi::GetConsoleMode;
     use winapi::um::wincon::*;
     use winapi::um::winuser;
 
@@ -1625,6 +1626,23 @@ mod windows_input_bridge_tests {
         }
 
         #[test]
+        fn win32_input_preserves_surrogate_pair_code_units() {
+            let mut encoder = WinInputEncoder::default();
+            let mut parser = termwiz::input::InputParser::new();
+            let high = key_record_u16(0, 0, 0xd83d, true, 1, 0);
+            let low = key_record_u16(0, 0, 0xde00, true, 1, 0);
+            let state = InnerInputState {
+                win32_input: true,
+                ..Default::default()
+            };
+
+            assert_eq!(
+                encoder.encode_records(&mut parser, &[high, low], &state),
+                b"\x1b[0;0;55357;1;0;1_\x1b[0;0;56832;1;0;1_"
+            );
+        }
+
+        #[test]
         fn key_up_is_ignored_in_plain_mode_and_encoded_in_win32_mode() {
             let mut encoder = WinInputEncoder::default();
             let mut parser = termwiz::input::InputParser::new();
@@ -1932,6 +1950,28 @@ mod windows_input_bridge_tests {
                 b""
             );
         }
+
+        #[test]
+        fn tracked_win32_mode_drives_encoded_key_records() {
+            let (state, mut tracker) = tracker();
+            let mut encoder = WinInputEncoder::default();
+            let mut parser = termwiz::input::InputParser::new();
+            let key = key_record('A' as u16, 0x1e, 'a', true, 1, 0);
+
+            assert_eq!(tracker.filter(b"\x1b[?9001h"), b"");
+            let state_snapshot = state.lock().unwrap().clone();
+            assert_eq!(
+                encoder.encode_records(&mut parser, &[key], &state_snapshot),
+                b"\x1b[65;30;97;1;0;1_"
+            );
+
+            assert_eq!(tracker.filter(b"\x1b[?9001l"), b"");
+            let state_snapshot = state.lock().unwrap().clone();
+            assert_eq!(
+                encoder.encode_records(&mut parser, &[key], &state_snapshot),
+                b"a"
+            );
+        }
     }
 
     mod batching {
@@ -2089,6 +2129,81 @@ mod windows_input_bridge_tests {
                 None
             );
         }
+
+        #[test]
+        fn encodes_right_and_middle_mouse_buttons() {
+            let mut encoder = WinInputEncoder::default();
+            let state = InnerInputState {
+                mouse_default: true,
+                mouse_tracking: MouseTrackingMode::Default,
+                sgr_mouse: true,
+                ..Default::default()
+            };
+
+            assert_eq!(
+                encoder
+                    .encode_mouse(&mouse_record(0, 0, RIGHTMOST_BUTTON_PRESSED, 0, 0), &state)
+                    .unwrap(),
+                b"\x1b[<2;1;1M"
+            );
+            assert_eq!(
+                encoder
+                    .encode_mouse(
+                        &mouse_record(0, 0, FROM_LEFT_2ND_BUTTON_PRESSED, 0, 0),
+                        &state
+                    )
+                    .unwrap(),
+                b"\x1b[<1;1;1M"
+            );
+        }
+
+        #[test]
+        fn double_click_uses_button_press_encoding() {
+            let mut encoder = WinInputEncoder::default();
+            let state = InnerInputState {
+                mouse_default: true,
+                mouse_tracking: MouseTrackingMode::Default,
+                sgr_mouse: true,
+                ..Default::default()
+            };
+
+            assert_eq!(
+                encoder
+                    .encode_mouse(
+                        &mouse_record(0, 0, FROM_LEFT_1ST_BUTTON_PRESSED, 0, DOUBLE_CLICK),
+                        &state
+                    )
+                    .unwrap(),
+                b"\x1b[<0;1;1M"
+            );
+        }
+
+        #[test]
+        fn wheel_modifiers_are_encoded() {
+            let mut encoder = WinInputEncoder::default();
+            let state = InnerInputState {
+                mouse_default: true,
+                mouse_tracking: MouseTrackingMode::Default,
+                sgr_mouse: true,
+                ..Default::default()
+            };
+
+            assert_eq!(
+                encoder
+                    .encode_mouse(
+                        &mouse_record(
+                            0,
+                            0,
+                            120u32 << 16,
+                            SHIFT_PRESSED | RIGHT_CTRL_PRESSED,
+                            MOUSE_WHEELED,
+                        ),
+                        &state
+                    )
+                    .unwrap(),
+                b"\x1b[<84;1;1M"
+            );
+        }
     }
 
     mod focus {
@@ -2151,10 +2266,24 @@ mod windows_input_bridge_tests {
         #[ignore = "requires an interactive Windows console input buffer"]
         fn write_console_input_records_are_read_and_encoded_by_bridge_reader() -> anyhow::Result<()>
         {
+            let conin = OpenOptions::new().read(true).write(true).open("CONIN$")?;
+            let conin_handle = conin.as_raw_handle() as *mut _;
+            let mut original_mode = 0;
+            assert_ne!(
+                unsafe { GetConsoleMode(conin_handle, &mut original_mode) },
+                0
+            );
+            assert_ne!(unsafe { FlushConsoleInputBuffer(conin_handle) }, 0);
+
             let mut tty = super::super::win::WinTty::new()?;
             tty.set_bridge_mode()?;
+            let mut bridge_mode = 0;
+            assert_ne!(unsafe { GetConsoleMode(conin_handle, &mut bridge_mode) }, 0);
+            assert_eq!(
+                bridge_mode & (ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT),
+                ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT
+            );
 
-            let conin = OpenOptions::new().read(true).write(true).open("CONIN$")?;
             let records = [
                 key_record('A' as u16, 0x1e, 'a', true, 1, 0),
                 mouse_input_record(mouse_record(
@@ -2170,7 +2299,7 @@ mod windows_input_bridge_tests {
             let mut written = 0;
             let ok = unsafe {
                 WriteConsoleInputW(
-                    conin.as_raw_handle() as *mut _,
+                    conin_handle,
                     records.as_ptr() as *mut _,
                     records.len() as u32,
                     &mut written,
@@ -2185,6 +2314,19 @@ mod windows_input_bridge_tests {
             assert_eq!(read[0].EventType, KEY_EVENT);
             assert_eq!(read[1].EventType, MOUSE_EVENT);
             assert_eq!(read[2].EventType, WINDOW_BUFFER_SIZE_EVENT);
+            let key = unsafe { read[0].Event.KeyEvent() };
+            assert_eq!(key.bKeyDown, TRUE);
+            assert_eq!(key.wVirtualKeyCode, 'A' as u16);
+            assert_eq!(key.wVirtualScanCode, 0x1e);
+            assert_eq!(*unsafe { key.uChar.UnicodeChar() }, 'a' as u16);
+            let mouse = unsafe { read[1].Event.MouseEvent() };
+            assert_eq!(mouse.dwMousePosition.X, 0);
+            assert_eq!(mouse.dwMousePosition.Y, 0);
+            assert_eq!(mouse.dwButtonState, FROM_LEFT_1ST_BUTTON_PRESSED);
+            assert_eq!(mouse.dwControlKeyState, SHIFT_PRESSED);
+            let resize = unsafe { read[2].Event.WindowBufferSizeEvent() };
+            assert_eq!(resize.dwSize.X, 120);
+            assert_eq!(resize.dwSize.Y, 40);
 
             let mut encoder = WinInputEncoder::default();
             let mut parser = termwiz::input::InputParser::new();
@@ -2198,6 +2340,15 @@ mod windows_input_bridge_tests {
                 encoder.encode_records(&mut parser, &read[..2], &state),
                 b"a\x1b[<4;1;1M"
             );
+
+            tty.set_cooked()?;
+            let mut restored_mode = 0;
+            assert_ne!(
+                unsafe { GetConsoleMode(conin_handle, &mut restored_mode) },
+                0
+            );
+            assert_eq!(restored_mode, original_mode);
+            assert_ne!(unsafe { FlushConsoleInputBuffer(conin_handle) }, 0);
 
             Ok(())
         }
