@@ -498,6 +498,27 @@ enum Message {
     Terminated(portable_pty::ExitStatus),
 }
 
+const STDOUT_DRAIN_AFTER_CHILD_EXIT: Duration = Duration::from_millis(500);
+
+fn stdout_drain_timeout_after_child_exit(
+    child_status_known: bool,
+    stdout_eof: bool,
+    child_terminated_at: Option<Instant>,
+    now: Instant,
+) -> Option<Duration> {
+    if !child_status_known || stdout_eof {
+        return None;
+    }
+
+    Some(
+        child_terminated_at
+            .unwrap_or(now)
+            .checked_add(STDOUT_DRAIN_AFTER_CHILD_EXIT)
+            .unwrap_or(now)
+            .saturating_duration_since(now),
+    )
+}
+
 #[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
 enum WinInputMode {
     #[default]
@@ -1360,6 +1381,35 @@ mod windows_input_bridge_tests {
     }
 
     #[test]
+    fn stdout_drain_timeout_only_applies_after_child_exit_before_stdout_eof() {
+        let now = Instant::now();
+
+        assert_eq!(
+            stdout_drain_timeout_after_child_exit(false, false, None, now),
+            None
+        );
+        assert_eq!(
+            stdout_drain_timeout_after_child_exit(true, true, Some(now), now),
+            None
+        );
+        assert_eq!(
+            stdout_drain_timeout_after_child_exit(true, false, Some(now), now),
+            Some(STDOUT_DRAIN_AFTER_CHILD_EXIT)
+        );
+    }
+
+    #[test]
+    fn stdout_drain_timeout_saturates_after_grace_period() {
+        let child_exit = Instant::now();
+        let after_grace = child_exit + STDOUT_DRAIN_AFTER_CHILD_EXIT + Duration::from_millis(1);
+
+        assert_eq!(
+            stdout_drain_timeout_after_child_exit(true, false, Some(child_exit), after_grace),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
     fn preserves_non_query_csi_output() {
         let (_state, mut tracker) = tracker();
 
@@ -2172,9 +2222,15 @@ impl RecordCommand {
 
         loop {
             let msg = if child_status.is_some() && !stdout_eof {
-                let deadline =
-                    child_terminated_at.unwrap_or_else(Instant::now) + Duration::from_millis(500);
-                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                match rx.recv_timeout(
+                    stdout_drain_timeout_after_child_exit(
+                        true,
+                        stdout_eof,
+                        child_terminated_at,
+                        Instant::now(),
+                    )
+                    .unwrap_or_default(),
+                ) {
                     Ok(msg) => msg,
                     Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
                 }
