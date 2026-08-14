@@ -627,7 +627,16 @@ impl InputModeTracker {
                 continue;
             }
 
-            if i + 2 >= data.len() {
+            if i + 1 >= data.len() {
+                self.pending.extend_from_slice(&data[i..]);
+                break;
+            }
+
+            if let Some(string_end) = Self::terminated_control_string_end(&data[i..]) {
+                output.extend_from_slice(&data[i..i + string_end]);
+                i += string_end;
+                continue;
+            } else if Self::starts_control_string(data[i + 1]) {
                 self.pending.extend_from_slice(&data[i..]);
                 break;
             }
@@ -636,6 +645,11 @@ impl InputModeTracker {
                 output.push(data[i]);
                 i += 1;
                 continue;
+            }
+
+            if i + 2 >= data.len() {
+                self.pending.extend_from_slice(&data[i..]);
+                break;
             }
 
             let mut end = i + 2;
@@ -705,6 +719,30 @@ impl InputModeTracker {
 
     fn owns_dec_private_mode(mode: u16) -> bool {
         matches!(mode, 1 | 1000 | 1002 | 1003 | 1004 | 1006 | 2004 | 9001)
+    }
+
+    fn starts_control_string(second_byte: u8) -> bool {
+        matches!(second_byte, b']' | b'P' | b'_' | b'^' | b'X')
+    }
+
+    fn terminated_control_string_end(bytes: &[u8]) -> Option<usize> {
+        if bytes.len() < 2 || bytes[0] != 0x1b || !Self::starts_control_string(bytes[1]) {
+            return None;
+        }
+
+        let terminates_on_bel = bytes[1] == b']';
+        let mut index = 2;
+        while index < bytes.len() {
+            if terminates_on_bel && bytes[index] == 0x07 {
+                return Some(index + 1);
+            }
+            if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                return Some(index + 2);
+            }
+            index += 1;
+        }
+
+        None
     }
 
     fn response_for_terminal_query(params: &[u8], final_byte: u8) -> Option<&'static [u8]> {
@@ -1182,6 +1220,37 @@ mod windows_input_bridge_tests {
         }
 
         #[test]
+        fn csi_with_intermediates_or_subparams_is_preserved_without_state_changes() {
+            let (state, mut tracker) = tracker();
+
+            for sequence in [
+                b"\x1b[?1000$h".as_slice(),
+                b"\x1b[?1000 h",
+                b"\x1b[?1000:1h",
+            ] {
+                assert_eq!(tracker.filter(sequence), sequence);
+            }
+
+            let state = state.lock().unwrap();
+            assert_eq!(state.mouse_tracking, MouseTrackingMode::None);
+            assert!(!state.mouse_default);
+        }
+
+        #[test]
+        fn unowned_mouse_modes_are_preserved_when_mixed_with_owned_modes() {
+            let (state, mut tracker) = tracker();
+
+            assert_eq!(
+                tracker.filter(b"\x1b[?1000;1005;1015;1016h"),
+                b"\x1b[?1005;1015;1016h"
+            );
+
+            let state = state.lock().unwrap();
+            assert_eq!(state.mouse_tracking, MouseTrackingMode::Default);
+            assert!(state.mouse_default);
+        }
+
+        #[test]
         fn mixed_owned_unowned_reset_filters_only_owned_modes() {
             let (state, mut tracker) = tracker();
 
@@ -1388,6 +1457,33 @@ mod windows_input_bridge_tests {
             assert_eq!(child_input, b"\x1b[1;1R");
             assert!(state.lock().unwrap().win32_input);
             assert_eq!(tracker.drain_pending(), b"");
+        }
+
+        #[test]
+        fn osc_payload_csi_like_bytes_are_preserved_without_state_or_responses() {
+            let (state, mut tracker) = tracker();
+
+            let (output, responses) =
+                tracker.filter_and_get_responses(b"pre\x1b]0;title \x1b[6n \x1b[?1000h\x07post");
+
+            assert_eq!(output, b"pre\x1b]0;title \x1b[6n \x1b[?1000h\x07post");
+            assert_eq!(responses, b"");
+            assert_eq!(
+                state.lock().unwrap().mouse_tracking,
+                MouseTrackingMode::None
+            );
+        }
+
+        #[test]
+        fn dcs_payload_csi_like_bytes_are_preserved_across_fragments() {
+            let (state, mut tracker) = tracker();
+
+            assert_eq!(tracker.filter(b"pre\x1bPtmux;\x1b\x1b[?9001h"), b"pre");
+            let (output, responses) = tracker.filter_and_get_responses(b"\x1b[6n\x1b\\post");
+
+            assert_eq!(output, b"\x1bPtmux;\x1b\x1b[?9001h\x1b[6n\x1b\\post");
+            assert_eq!(responses, b"");
+            assert!(!state.lock().unwrap().win32_input);
         }
 
         #[test]
