@@ -1165,6 +1165,67 @@ mod windows_input_bridge_tests {
         record
     }
 
+    fn encode_records_with_state(records: &[INPUT_RECORD], state: &InnerInputState) -> Vec<u8> {
+        let mut encoder = WinInputEncoder::default();
+        let mut parser = termwiz::input::InputParser::new();
+        encoder.encode_records(&mut parser, records, state)
+    }
+
+    fn encode_records_default(records: &[INPUT_RECORD]) -> Vec<u8> {
+        encode_records_with_state(records, &InnerInputState::default())
+    }
+
+    fn encode_mouse_with_state(
+        mouse: &MOUSE_EVENT_RECORD,
+        state: &InnerInputState,
+    ) -> Option<Vec<u8>> {
+        WinInputEncoder::default().encode_mouse(mouse, state)
+    }
+
+    fn win32_state() -> InnerInputState {
+        InnerInputState {
+            win32_input: true,
+            ..Default::default()
+        }
+    }
+
+    fn sgr_mouse_state(mouse_tracking: MouseTrackingMode) -> InnerInputState {
+        InnerInputState {
+            mouse_default: matches!(mouse_tracking, MouseTrackingMode::Default),
+            mouse_button_event: matches!(mouse_tracking, MouseTrackingMode::ButtonEvent),
+            mouse_any_event: matches!(mouse_tracking, MouseTrackingMode::AnyEvent),
+            mouse_tracking,
+            sgr_mouse: true,
+            ..Default::default()
+        }
+    }
+
+    fn legacy_mouse_state(mouse_tracking: MouseTrackingMode) -> InnerInputState {
+        InnerInputState {
+            mouse_default: matches!(mouse_tracking, MouseTrackingMode::Default),
+            mouse_button_event: matches!(mouse_tracking, MouseTrackingMode::ButtonEvent),
+            mouse_any_event: matches!(mouse_tracking, MouseTrackingMode::AnyEvent),
+            mouse_tracking,
+            sgr_mouse: false,
+            ..Default::default()
+        }
+    }
+
+    fn expected_win32_key(
+        virtual_key: u16,
+        scan_code: u16,
+        unicode: u32,
+        key_down: bool,
+        control_state: u32,
+        repeat_count: u16,
+    ) -> Vec<u8> {
+        format!(
+            "\x1b[{virtual_key};{scan_code};{unicode};{};{control_state};{repeat_count}_",
+            if key_down { 1 } else { 0 }
+        )
+        .into_bytes()
+    }
+
     mod tracker_and_run_loop {
         use super::*;
 
@@ -1565,131 +1626,83 @@ mod windows_input_bridge_tests {
 
         #[test]
         fn application_cursor_mode_changes_arrow_encoding() {
-            let mut encoder = WinInputEncoder::default();
-            let mut parser = termwiz::input::InputParser::new();
             let up = key_record(winuser::VK_UP as u16, 0x48, '\0', true, 1, 0);
 
-            assert_eq!(
-                encoder.encode_records(&mut parser, &[up], &InnerInputState::default()),
-                b"\x1b[A"
-            );
+            assert_eq!(encode_records_default(&[up]), b"\x1b[A");
 
             let state = InnerInputState {
                 application_cursor_keys: true,
                 ..Default::default()
             };
-            assert_eq!(
-                encoder.encode_records(&mut parser, &[up], &state),
-                b"\x1bOA"
-            );
+            assert_eq!(encode_records_with_state(&[up], &state), b"\x1bOA");
         }
 
         #[test]
         fn preserves_record_order_between_non_printable_and_printable_keys() {
-            let mut encoder = WinInputEncoder::default();
-            let mut parser = termwiz::input::InputParser::new();
             let left = key_record(winuser::VK_LEFT as u16, 0x4b, '\0', true, 1, 0);
             let a = key_record('A' as u16, 0x1e, 'a', true, 1, 0);
 
-            assert_eq!(
-                encoder.encode_records(&mut parser, &[left, a], &InnerInputState::default()),
-                b"\x1b[Da"
-            );
+            assert_eq!(encode_records_default(&[left, a]), b"\x1b[Da");
         }
 
         #[test]
         fn repeats_plain_printable_key_records() {
-            let mut encoder = WinInputEncoder::default();
-            let mut parser = termwiz::input::InputParser::new();
             let a = key_record('A' as u16, 0x1e, 'a', true, 3, 0);
 
-            assert_eq!(
-                encoder.encode_records(&mut parser, &[a], &InnerInputState::default()),
-                b"aaa"
-            );
+            assert_eq!(encode_records_default(&[a]), b"aaa");
         }
 
         #[test]
         fn win32_input_encodes_printable_key_records() {
-            let mut encoder = WinInputEncoder::default();
-            let mut parser = termwiz::input::InputParser::new();
             let a = key_record('A' as u16, 0x1e, 'a', true, 2, 0);
-            let state = InnerInputState {
-                win32_input: true,
-                ..Default::default()
-            };
 
             assert_eq!(
-                encoder.encode_records(&mut parser, &[a], &state),
-                b"\x1b[65;30;97;1;0;2_"
+                encode_records_with_state(&[a], &win32_state()),
+                expected_win32_key(65, 30, 97, true, 0, 2)
             );
         }
 
         #[test]
         fn win32_input_preserves_surrogate_pair_code_units() {
-            let mut encoder = WinInputEncoder::default();
-            let mut parser = termwiz::input::InputParser::new();
             let high = key_record_u16(0, 0, 0xd83d, true, 1, 0);
             let low = key_record_u16(0, 0, 0xde00, true, 1, 0);
-            let state = InnerInputState {
-                win32_input: true,
-                ..Default::default()
-            };
 
             assert_eq!(
-                encoder.encode_records(&mut parser, &[high, low], &state),
-                b"\x1b[0;0;55357;1;0;1_\x1b[0;0;56832;1;0;1_"
+                encode_records_with_state(&[high, low], &win32_state()),
+                [
+                    expected_win32_key(0, 0, 0xd83d, true, 0, 1),
+                    expected_win32_key(0, 0, 0xde00, true, 0, 1)
+                ]
+                .concat()
             );
         }
 
         #[test]
         fn key_up_is_ignored_in_plain_mode_and_encoded_in_win32_mode() {
-            let mut encoder = WinInputEncoder::default();
-            let mut parser = termwiz::input::InputParser::new();
             let a_up = key_record('A' as u16, 0x1e, 'a', false, 1, 0);
 
-            assert_eq!(
-                encoder.encode_records(&mut parser, &[a_up], &InnerInputState::default()),
-                b""
-            );
+            assert_eq!(encode_records_default(&[a_up]), b"");
 
-            let state = InnerInputState {
-                win32_input: true,
-                ..Default::default()
-            };
             assert_eq!(
-                encoder.encode_records(&mut parser, &[a_up], &state),
-                b"\x1b[65;30;97;0;0;1_"
+                encode_records_with_state(&[a_up], &win32_state()),
+                expected_win32_key(65, 30, 97, false, 0, 1)
             );
         }
 
         #[test]
         fn repeats_non_printable_key_records() {
-            let mut encoder = WinInputEncoder::default();
-            let mut parser = termwiz::input::InputParser::new();
             let up = key_record(winuser::VK_UP as u16, 0x48, '\0', true, 3, 0);
 
-            assert_eq!(
-                encoder.encode_records(&mut parser, &[up], &InnerInputState::default()),
-                b"\x1b[A\x1b[A\x1b[A"
-            );
+            assert_eq!(encode_records_default(&[up]), b"\x1b[A\x1b[A\x1b[A");
         }
 
         #[test]
         fn plain_text_preserves_bmp_unicode_and_ignores_unpaired_surrogates() {
-            let mut encoder = WinInputEncoder::default();
-            let mut parser = termwiz::input::InputParser::new();
             let e_acute = key_record(0, 0, 'é', true, 2, 0);
             let high_surrogate = key_record_u16(0, 0, 0xd83d, true, 1, 0);
 
-            assert_eq!(
-                encoder.encode_records(&mut parser, &[e_acute], &InnerInputState::default()),
-                "éé".as_bytes()
-            );
-            assert_eq!(
-                encoder.encode_records(&mut parser, &[high_surrogate], &InnerInputState::default()),
-                b""
-            );
+            assert_eq!(encode_records_default(&[e_acute]), "éé".as_bytes());
+            assert_eq!(encode_records_default(&[high_surrogate]), b"");
         }
 
         #[test]
@@ -1789,17 +1802,11 @@ mod windows_input_bridge_tests {
 
         #[test]
         fn encodes_sgr_horizontal_mouse_wheel() {
-            let mut encoder = WinInputEncoder::default();
-            let state = InnerInputState {
-                mouse_any_event: true,
-                mouse_tracking: MouseTrackingMode::AnyEvent,
-                sgr_mouse: true,
-                ..Default::default()
-            };
+            let state = sgr_mouse_state(MouseTrackingMode::AnyEvent);
             let mouse = mouse_record(41, 11, 120u32 << 16, 0, MOUSE_HWHEELED);
 
             assert_eq!(
-                encoder.encode_mouse(&mouse, &state).unwrap(),
+                encode_mouse_with_state(&mouse, &state).unwrap(),
                 b"\x1b[<66;42;12M"
             );
         }
@@ -1807,12 +1814,7 @@ mod windows_input_bridge_tests {
         #[test]
         fn encodes_sgr_wheel_directions() {
             let mut encoder = WinInputEncoder::default();
-            let state = InnerInputState {
-                mouse_any_event: true,
-                mouse_tracking: MouseTrackingMode::AnyEvent,
-                sgr_mouse: true,
-                ..Default::default()
-            };
+            let state = sgr_mouse_state(MouseTrackingMode::AnyEvent);
 
             assert_eq!(
                 encoder
@@ -1846,12 +1848,7 @@ mod windows_input_bridge_tests {
         #[test]
         fn wheel_delta_does_not_create_later_button_release() {
             let mut encoder = WinInputEncoder::default();
-            let state = InnerInputState {
-                mouse_default: true,
-                mouse_tracking: MouseTrackingMode::Default,
-                sgr_mouse: true,
-                ..Default::default()
-            };
+            let state = sgr_mouse_state(MouseTrackingMode::Default);
 
             assert_eq!(
                 encoder
@@ -1872,36 +1869,21 @@ mod windows_input_bridge_tests {
             let press = mouse_record(0, 0, FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0);
 
             let mut encoder = WinInputEncoder::default();
-            let state = InnerInputState {
-                mouse_default: true,
-                mouse_tracking: MouseTrackingMode::Default,
-                sgr_mouse: true,
-                ..Default::default()
-            };
+            let state = sgr_mouse_state(MouseTrackingMode::Default);
             assert!(encoder.encode_mouse(&hover, &state).is_none());
             assert_eq!(
                 encoder.encode_mouse(&press, &state).unwrap(),
                 b"\x1b[<0;1;1M"
             );
 
-            let state = InnerInputState {
-                mouse_button_event: true,
-                mouse_tracking: MouseTrackingMode::ButtonEvent,
-                sgr_mouse: true,
-                ..Default::default()
-            };
+            let state = sgr_mouse_state(MouseTrackingMode::ButtonEvent);
             assert!(encoder.encode_mouse(&hover, &state).is_none());
             assert_eq!(
                 encoder.encode_mouse(&drag, &state).unwrap(),
                 b"\x1b[<32;1;1M"
             );
 
-            let state = InnerInputState {
-                mouse_any_event: true,
-                mouse_tracking: MouseTrackingMode::AnyEvent,
-                sgr_mouse: true,
-                ..Default::default()
-            };
+            let state = sgr_mouse_state(MouseTrackingMode::AnyEvent);
             assert_eq!(
                 encoder.encode_mouse(&hover, &state).unwrap(),
                 b"\x1b[<35;1;1M"
@@ -1911,12 +1893,7 @@ mod windows_input_bridge_tests {
         #[test]
         fn sgr_mouse_press_and_release_preserve_button() {
             let mut encoder = WinInputEncoder::default();
-            let state = InnerInputState {
-                mouse_default: true,
-                mouse_tracking: MouseTrackingMode::Default,
-                sgr_mouse: true,
-                ..Default::default()
-            };
+            let state = sgr_mouse_state(MouseTrackingMode::Default);
             let records = [
                 mouse_input_record(mouse_record(0, 0, FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0)),
                 mouse_input_record(mouse_record(0, 0, 0, 0, 0)),
@@ -2008,17 +1985,11 @@ mod windows_input_bridge_tests {
 
         #[test]
         fn encodes_legacy_mouse_when_sgr_is_not_enabled() {
-            let mut encoder = WinInputEncoder::default();
-            let state = InnerInputState {
-                mouse_default: true,
-                mouse_tracking: MouseTrackingMode::Default,
-                sgr_mouse: false,
-                ..Default::default()
-            };
+            let state = legacy_mouse_state(MouseTrackingMode::Default);
             let mouse = mouse_record(0, 0, FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0);
 
             assert_eq!(
-                encoder.encode_mouse(&mouse, &state).unwrap(),
+                encode_mouse_with_state(&mouse, &state).unwrap(),
                 vec![0x1b, b'[', b'M', 32, 33, 33]
             );
         }
@@ -2043,13 +2014,7 @@ mod windows_input_bridge_tests {
 
         #[test]
         fn mouse_modifiers_are_encoded() {
-            let mut encoder = WinInputEncoder::default();
-            let state = InnerInputState {
-                mouse_default: true,
-                mouse_tracking: MouseTrackingMode::Default,
-                sgr_mouse: true,
-                ..Default::default()
-            };
+            let state = sgr_mouse_state(MouseTrackingMode::Default);
             let mouse = mouse_record(
                 0,
                 0,
@@ -2059,37 +2024,31 @@ mod windows_input_bridge_tests {
             );
 
             assert_eq!(
-                encoder.encode_mouse(&mouse, &state).unwrap(),
+                encode_mouse_with_state(&mouse, &state).unwrap(),
                 b"\x1b[<28;1;1M"
             );
         }
 
         #[test]
         fn legacy_mouse_rejects_coordinates_outside_protocol_range() {
-            let mut encoder = WinInputEncoder::default();
-            let state = InnerInputState {
-                mouse_default: true,
-                mouse_tracking: MouseTrackingMode::Default,
-                sgr_mouse: false,
-                ..Default::default()
-            };
+            let state = legacy_mouse_state(MouseTrackingMode::Default);
 
             assert_eq!(
-                encoder.encode_mouse(
+                encode_mouse_with_state(
                     &mouse_record(222, 222, FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0),
                     &state
                 ),
                 Some(vec![0x1b, b'[', b'M', 32, 255, 255])
             );
             assert_eq!(
-                encoder.encode_mouse(
+                encode_mouse_with_state(
                     &mouse_record(223, 222, FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0),
                     &state
                 ),
                 None
             );
             assert_eq!(
-                encoder.encode_mouse(
+                encode_mouse_with_state(
                     &mouse_record(222, 223, FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0),
                     &state
                 ),
@@ -2100,12 +2059,7 @@ mod windows_input_bridge_tests {
         #[test]
         fn mouse_disabled_while_button_held_does_not_emit_stale_release() {
             let mut encoder = WinInputEncoder::default();
-            let enabled = InnerInputState {
-                mouse_default: true,
-                mouse_tracking: MouseTrackingMode::Default,
-                sgr_mouse: true,
-                ..Default::default()
-            };
+            let enabled = sgr_mouse_state(MouseTrackingMode::Default);
 
             assert_eq!(
                 encoder
@@ -2132,75 +2086,56 @@ mod windows_input_bridge_tests {
 
         #[test]
         fn encodes_right_and_middle_mouse_buttons() {
-            let mut encoder = WinInputEncoder::default();
-            let state = InnerInputState {
-                mouse_default: true,
-                mouse_tracking: MouseTrackingMode::Default,
-                sgr_mouse: true,
-                ..Default::default()
-            };
+            let state = sgr_mouse_state(MouseTrackingMode::Default);
 
             assert_eq!(
-                encoder
-                    .encode_mouse(&mouse_record(0, 0, RIGHTMOST_BUTTON_PRESSED, 0, 0), &state)
-                    .unwrap(),
+                encode_mouse_with_state(
+                    &mouse_record(0, 0, RIGHTMOST_BUTTON_PRESSED, 0, 0),
+                    &state
+                )
+                .unwrap(),
                 b"\x1b[<2;1;1M"
             );
             assert_eq!(
-                encoder
-                    .encode_mouse(
-                        &mouse_record(0, 0, FROM_LEFT_2ND_BUTTON_PRESSED, 0, 0),
-                        &state
-                    )
-                    .unwrap(),
+                encode_mouse_with_state(
+                    &mouse_record(0, 0, FROM_LEFT_2ND_BUTTON_PRESSED, 0, 0),
+                    &state
+                )
+                .unwrap(),
                 b"\x1b[<1;1;1M"
             );
         }
 
         #[test]
         fn double_click_uses_button_press_encoding() {
-            let mut encoder = WinInputEncoder::default();
-            let state = InnerInputState {
-                mouse_default: true,
-                mouse_tracking: MouseTrackingMode::Default,
-                sgr_mouse: true,
-                ..Default::default()
-            };
+            let state = sgr_mouse_state(MouseTrackingMode::Default);
 
             assert_eq!(
-                encoder
-                    .encode_mouse(
-                        &mouse_record(0, 0, FROM_LEFT_1ST_BUTTON_PRESSED, 0, DOUBLE_CLICK),
-                        &state
-                    )
-                    .unwrap(),
+                encode_mouse_with_state(
+                    &mouse_record(0, 0, FROM_LEFT_1ST_BUTTON_PRESSED, 0, DOUBLE_CLICK),
+                    &state
+                )
+                .unwrap(),
                 b"\x1b[<0;1;1M"
             );
         }
 
         #[test]
         fn wheel_modifiers_are_encoded() {
-            let mut encoder = WinInputEncoder::default();
-            let state = InnerInputState {
-                mouse_default: true,
-                mouse_tracking: MouseTrackingMode::Default,
-                sgr_mouse: true,
-                ..Default::default()
-            };
+            let state = sgr_mouse_state(MouseTrackingMode::Default);
 
             assert_eq!(
-                encoder
-                    .encode_mouse(
-                        &mouse_record(
-                            0,
-                            0,
-                            120u32 << 16,
-                            SHIFT_PRESSED | RIGHT_CTRL_PRESSED,
-                            MOUSE_WHEELED,
-                        ),
-                        &state
-                    )
-                    .unwrap(),
+                encode_mouse_with_state(
+                    &mouse_record(
+                        0,
+                        0,
+                        120u32 << 16,
+                        SHIFT_PRESSED | RIGHT_CTRL_PRESSED,
+                        MOUSE_WHEELED,
+                    ),
+                    &state
+                )
+                .unwrap(),
                 b"\x1b[<84;1;1M"
             );
         }
