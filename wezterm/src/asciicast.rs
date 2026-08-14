@@ -655,6 +655,11 @@ impl InputModeTracker {
         let mut i = 0;
         while i < data.len() {
             if data[i] != 0x1b {
+                if let Some(string_end) = Self::terminated_c1_control_string_end(&data[i..]) {
+                    output.extend_from_slice(&data[i..i + string_end]);
+                    i += string_end;
+                    continue;
+                }
                 output.push(data[i]);
                 i += 1;
                 continue;
@@ -686,8 +691,19 @@ impl InputModeTracker {
             }
 
             let mut end = i + 2;
+            let mut abort_at_esc = None;
             while end < data.len() && !(0x40..=0x7e).contains(&data[end]) {
+                if data[end] == 0x1b {
+                    abort_at_esc = Some(end);
+                    break;
+                }
                 end += 1;
+            }
+
+            if let Some(esc) = abort_at_esc {
+                output.extend_from_slice(&data[i..esc]);
+                i = esc;
+                continue;
             }
 
             if end == data.len() {
@@ -758,6 +774,10 @@ impl InputModeTracker {
         matches!(second_byte, b']' | b'P' | b'_' | b'^' | b'X')
     }
 
+    fn starts_c1_control_string(byte: u8) -> bool {
+        matches!(byte, 0x90 | 0x98 | 0x9d | 0x9e | 0x9f)
+    }
+
     fn terminated_control_string_end(bytes: &[u8]) -> Option<usize> {
         if bytes.len() < 2 || bytes[0] != 0x1b || !Self::starts_control_string(bytes[1]) {
             return None;
@@ -767,6 +787,29 @@ impl InputModeTracker {
         let mut index = 2;
         while index < bytes.len() {
             if terminates_on_bel && bytes[index] == 0x07 {
+                return Some(index + 1);
+            }
+            if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                return Some(index + 2);
+            }
+            index += 1;
+        }
+
+        None
+    }
+
+    fn terminated_c1_control_string_end(bytes: &[u8]) -> Option<usize> {
+        if bytes.is_empty() || !Self::starts_c1_control_string(bytes[0]) {
+            return None;
+        }
+
+        let terminates_on_bel = bytes[0] == 0x9d;
+        let mut index = 1;
+        while index < bytes.len() {
+            if terminates_on_bel && bytes[index] == 0x07 {
+                return Some(index + 1);
+            }
+            if bytes[index] == 0x9c {
                 return Some(index + 1);
             }
             if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
@@ -1283,6 +1326,7 @@ mod windows_input_bridge_tests {
         fn configure_with_counts(
             mode: WinInputMode,
             bridge_fails: bool,
+            raw_fails: bool,
         ) -> anyhow::Result<(bool, u32, u32, u32)> {
             let raw_calls = Cell::new(0);
             let bridge_calls = Cell::new(0);
@@ -1294,6 +1338,9 @@ mod windows_input_bridge_tests {
                     match action {
                         WindowsInputBridgeAction::SetRaw => {
                             raw_calls.set(raw_calls.get() + 1);
+                            if raw_fails {
+                                anyhow::bail!("raw setup failed");
+                            }
                         }
                         WindowsInputBridgeAction::SetBridgeMode => {
                             bridge_calls.set(bridge_calls.get() + 1);
@@ -1313,7 +1360,7 @@ mod windows_input_bridge_tests {
         #[test]
         fn off_uses_legacy_raw_input_without_trying_bridge() {
             assert_eq!(
-                configure_with_counts(WinInputMode::Off, true).unwrap(),
+                configure_with_counts(WinInputMode::Off, true, false).unwrap(),
                 (false, 1, 0, 0)
             );
         }
@@ -1321,7 +1368,7 @@ mod windows_input_bridge_tests {
         #[test]
         fn auto_uses_bridge_when_setup_succeeds() {
             assert_eq!(
-                configure_with_counts(WinInputMode::Auto, false).unwrap(),
+                configure_with_counts(WinInputMode::Auto, false, false).unwrap(),
                 (true, 0, 1, 0)
             );
         }
@@ -1329,9 +1376,23 @@ mod windows_input_bridge_tests {
         #[test]
         fn auto_warns_and_falls_back_to_raw_when_bridge_setup_fails() {
             assert_eq!(
-                configure_with_counts(WinInputMode::Auto, true).unwrap(),
+                configure_with_counts(WinInputMode::Auto, true, false).unwrap(),
                 (false, 1, 1, 1)
             );
+        }
+
+        #[test]
+        fn off_propagates_raw_setup_failure() {
+            let err = configure_with_counts(WinInputMode::Off, false, true).unwrap_err();
+
+            assert_eq!(err.to_string(), "raw setup failed");
+        }
+
+        #[test]
+        fn auto_propagates_raw_fallback_failure_after_bridge_warning() {
+            let err = configure_with_counts(WinInputMode::Auto, true, true).unwrap_err();
+
+            assert_eq!(err.to_string(), "raw setup failed");
         }
 
         #[test]
@@ -1360,6 +1421,37 @@ mod windows_input_bridge_tests {
             assert_eq!(raw_calls.get(), 0);
             assert_eq!(bridge_calls.get(), 1);
             assert_eq!(warnings.get(), 0);
+        }
+
+        #[test]
+        fn record_command_parses_win_input_values() {
+            assert_eq!(
+                RecordCommand::try_parse_from(["record"]).unwrap().win_input,
+                WinInputMode::Auto
+            );
+            assert_eq!(
+                RecordCommand::try_parse_from(["record", "--win-input", "auto"])
+                    .unwrap()
+                    .win_input,
+                WinInputMode::Auto
+            );
+            assert_eq!(
+                RecordCommand::try_parse_from(["record", "--win-input", "on"])
+                    .unwrap()
+                    .win_input,
+                WinInputMode::On
+            );
+            assert_eq!(
+                RecordCommand::try_parse_from(["record", "--win-input", "off"])
+                    .unwrap()
+                    .win_input,
+                WinInputMode::Off
+            );
+        }
+
+        #[test]
+        fn record_command_rejects_invalid_win_input_value() {
+            assert!(RecordCommand::try_parse_from(["record", "--win-input", "maybe"]).is_err());
         }
     }
 
@@ -1447,6 +1539,26 @@ mod windows_input_bridge_tests {
             let state = state.lock().unwrap();
             assert_eq!(state.mouse_tracking, MouseTrackingMode::Default);
             assert!(state.mouse_default);
+        }
+
+        #[test]
+        fn unowned_modes_are_preserved_with_button_and_any_event_modes() {
+            let (state, mut tracker) = tracker();
+
+            assert_eq!(
+                tracker.filter(b"\x1b[?25;1002;1003;1016h"),
+                b"\x1b[?25;1016h"
+            );
+            assert_eq!(
+                state.lock().unwrap().mouse_tracking,
+                MouseTrackingMode::AnyEvent
+            );
+
+            assert_eq!(tracker.filter(b"\x1b[?25;1003;1016l"), b"\x1b[?25;1016l");
+            assert_eq!(
+                state.lock().unwrap().mouse_tracking,
+                MouseTrackingMode::ButtonEvent
+            );
         }
 
         #[test]
@@ -1567,6 +1679,19 @@ mod windows_input_bridge_tests {
                 state.lock().unwrap().mouse_tracking,
                 MouseTrackingMode::None
             );
+        }
+
+        #[test]
+        fn pending_malformed_csi_before_new_escape_is_preserved() {
+            let (state, mut tracker) = tracker();
+
+            assert_eq!(tracker.filter(b"\x1b[?"), b"");
+            let (output, responses) =
+                tracker.filter_and_get_responses(b"\x1b]0;\x1b[6n\x1b[?9001h\x07tail");
+
+            assert_eq!(output, b"\x1b[?\x1b]0;\x1b[6n\x1b[?9001h\x07tail");
+            assert_eq!(responses, b"");
+            assert!(!state.lock().unwrap().win32_input);
         }
 
         #[test]
@@ -1764,6 +1889,34 @@ mod windows_input_bridge_tests {
         }
 
         #[test]
+        fn control_strings_are_preserved_when_split_at_every_byte() {
+            for sequence in [
+                b"\x1b]0;osc \x1b[6n \x1b[?9001h\x07after".as_slice(),
+                b"\x1b]0;osc \x1b[6n \x1b[?9001h\x1b\\after",
+                b"\x1bPpayload \x1b[c \x1b[?1000h\x1b\\after",
+                b"\x1b_payload \x1b[5n \x1b[?1002h\x1b\\after",
+                b"\x1b^payload \x1b[6n \x1b[?1003h\x1b\\after",
+                b"\x1bXpayload \x1b[>0c \x1b[?2004h\x1b\\after",
+            ] {
+                for split_at in 1..sequence.len() {
+                    let (state, mut tracker) = tracker();
+                    let mut combined_output = tracker.filter(&sequence[..split_at]);
+
+                    let (output, responses) =
+                        tracker.filter_and_get_responses(&sequence[split_at..]);
+                    combined_output.extend_from_slice(&output);
+
+                    assert_eq!(combined_output, sequence);
+                    assert_eq!(responses, b"");
+                    let state = state.lock().unwrap();
+                    assert!(!state.win32_input);
+                    assert_eq!(state.mouse_tracking, MouseTrackingMode::None);
+                    assert!(!state.bracketed_paste);
+                }
+            }
+        }
+
+        #[test]
         fn split_control_string_st_terminator_is_preserved() {
             let (_state, mut tracker) = tracker();
 
@@ -1781,6 +1934,28 @@ mod windows_input_bridge_tests {
             assert_eq!(output, c1);
             assert_eq!(responses, b"");
             assert!(!state.lock().unwrap().win32_input);
+        }
+
+        #[test]
+        fn c1_control_strings_are_passed_through_without_state_or_responses() {
+            for sequence in [
+                b"\x9d0;osc \x1b[6n \x1b[?9001h\x07after".as_slice(),
+                b"\x90dcs \x1b[c \x1b[?1000h\x9cafter",
+                b"\x9fapc \x1b[5n \x1b[?1002h\x9cafter",
+                b"\x9epm \x1b[6n \x1b[?1003h\x9cafter",
+                b"\x98sos \x1b[>0c \x1b[?2004h\x9cafter",
+            ] {
+                let (state, mut tracker) = tracker();
+
+                let (output, responses) = tracker.filter_and_get_responses(sequence);
+
+                assert_eq!(output, sequence);
+                assert_eq!(responses, b"");
+                let state = state.lock().unwrap();
+                assert!(!state.win32_input);
+                assert_eq!(state.mouse_tracking, MouseTrackingMode::None);
+                assert!(!state.bracketed_paste);
+            }
         }
 
         #[test]
@@ -1950,6 +2125,45 @@ mod windows_input_bridge_tests {
         }
 
         #[test]
+        fn win32_input_preserves_control_state_matrix() {
+            for control_state in [
+                LEFT_CTRL_PRESSED,
+                RIGHT_CTRL_PRESSED,
+                LEFT_ALT_PRESSED,
+                RIGHT_ALT_PRESSED,
+                LEFT_CTRL_PRESSED | RIGHT_ALT_PRESSED,
+                CAPSLOCK_ON | NUMLOCK_ON | SCROLLLOCK_ON,
+                ENHANCED_KEY | SHIFT_PRESSED,
+            ] {
+                let down = key_record(winuser::VK_LEFT as u16, 0x4b, '\0', true, 1, control_state);
+                let up = key_record(winuser::VK_LEFT as u16, 0x4b, '\0', false, 1, control_state);
+
+                assert_eq!(
+                    encode_records_with_state(&[down, up], &win32_state()),
+                    [
+                        expected_win32_key(
+                            winuser::VK_LEFT as u16,
+                            0x4b,
+                            0,
+                            true,
+                            control_state,
+                            1
+                        ),
+                        expected_win32_key(
+                            winuser::VK_LEFT as u16,
+                            0x4b,
+                            0,
+                            false,
+                            control_state,
+                            1
+                        ),
+                    ]
+                    .concat()
+                );
+            }
+        }
+
+        #[test]
         fn key_up_is_ignored_in_plain_mode_and_encoded_in_win32_mode() {
             let a_up = key_record('A' as u16, 0x1e, 'a', false, 1, 0);
 
@@ -1983,6 +2197,35 @@ mod windows_input_bridge_tests {
 
             assert_eq!(encode_records_default(&[shifted_tab]), b"\x1b[Z");
             assert_eq!(encode_records_default(&[ctrl_left]), b"\x1b[1;5D");
+        }
+
+        #[test]
+        fn alt_and_enhanced_non_printable_keys_encode_xterm_modifiers() {
+            let alt_up = key_record(winuser::VK_UP as u16, 0x48, '\0', true, 1, LEFT_ALT_PRESSED);
+            let ctrl_alt_right = key_record(
+                winuser::VK_RIGHT as u16,
+                0x4d,
+                '\0',
+                true,
+                1,
+                LEFT_CTRL_PRESSED | RIGHT_ALT_PRESSED | ENHANCED_KEY,
+            );
+
+            assert_eq!(encode_records_default(&[alt_up]), b"\x1b[1;3A");
+            assert_eq!(encode_records_default(&[ctrl_alt_right]), b"\x1b[1;7C");
+        }
+
+        #[test]
+        fn unknown_event_types_are_ignored_without_disturbing_key_order() {
+            let mut unknown: INPUT_RECORD = unsafe { std::mem::zeroed() };
+            unknown.EventType = 0xffff;
+            let records = [
+                key_record('A' as u16, 0x1e, 'a', true, 1, 0),
+                unknown,
+                key_record('B' as u16, 0x30, 'b', true, 1, 0),
+            ];
+
+            assert_eq!(encode_records_default(&records), b"ab");
         }
 
         #[test]
@@ -2196,6 +2439,58 @@ mod windows_input_bridge_tests {
         }
 
         #[test]
+        fn sgr_right_and_middle_releases_preserve_button() {
+            for (button, expected) in [
+                (
+                    RIGHTMOST_BUTTON_PRESSED,
+                    b"\x1b[<2;1;1M\x1b[<2;1;1m".as_slice(),
+                ),
+                (FROM_LEFT_2ND_BUTTON_PRESSED, b"\x1b[<1;1;1M\x1b[<1;1;1m"),
+            ] {
+                let mut encoder = WinInputEncoder::default();
+                let mut parser = termwiz::input::InputParser::new();
+                let state = sgr_mouse_state(MouseTrackingMode::Default);
+                let records = [
+                    mouse_input_record(mouse_record(0, 0, button, 0, 0)),
+                    mouse_input_record(mouse_record(0, 0, 0, 0, 0)),
+                ];
+
+                assert_eq!(
+                    encoder.encode_records(&mut parser, &records, &state),
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn sgr_multi_button_transition_uses_lowest_tracked_button() {
+            let mut encoder = WinInputEncoder::default();
+            let state = sgr_mouse_state(MouseTrackingMode::Default);
+
+            assert_eq!(
+                encoder
+                    .encode_mouse(
+                        &mouse_record(
+                            0,
+                            0,
+                            FROM_LEFT_1ST_BUTTON_PRESSED | RIGHTMOST_BUTTON_PRESSED,
+                            0,
+                            0,
+                        ),
+                        &state
+                    )
+                    .unwrap(),
+                b"\x1b[<0;1;1M"
+            );
+            assert_eq!(
+                encoder
+                    .encode_mouse(&mouse_record(0, 0, RIGHTMOST_BUTTON_PRESSED, 0, 0), &state)
+                    .unwrap(),
+                b"\x1b[<2;1;1M"
+            );
+        }
+
+        #[test]
         fn tracked_mouse_modes_drive_encoded_mouse_records() {
             let (state, mut tracker) = tracker();
             assert_eq!(tracker.filter(b"\x1b[?1000;1006h"), b"");
@@ -2381,6 +2676,52 @@ mod windows_input_bridge_tests {
             assert_eq!(
                 encoder.encode_mouse(&mouse, &state).unwrap(),
                 vec![0x1b, b'[', b'M', 35, 33, 33]
+            );
+        }
+
+        #[test]
+        fn legacy_right_and_middle_releases_preserve_release_marker() {
+            for button in [RIGHTMOST_BUTTON_PRESSED, FROM_LEFT_2ND_BUTTON_PRESSED] {
+                let mut encoder = WinInputEncoder::default();
+                encoder.last_mouse_buttons = button;
+                let state = legacy_mouse_state(MouseTrackingMode::Default);
+
+                assert_eq!(
+                    encoder
+                        .encode_mouse(&mouse_record(0, 0, 0, 0, 0), &state)
+                        .unwrap(),
+                    vec![0x1b, b'[', b'M', 35, 33, 33]
+                );
+            }
+        }
+
+        #[test]
+        fn legacy_mouse_encodes_wheels() {
+            let state = legacy_mouse_state(MouseTrackingMode::Default);
+
+            assert_eq!(
+                encode_mouse_with_state(
+                    &mouse_record(0, 0, 120u32 << 16, 0, MOUSE_WHEELED),
+                    &state
+                )
+                .unwrap(),
+                vec![0x1b, b'[', b'M', 96, 33, 33]
+            );
+            assert_eq!(
+                encode_mouse_with_state(
+                    &mouse_record(0, 0, (-120i32 as u32) << 16, 0, MOUSE_WHEELED),
+                    &state
+                )
+                .unwrap(),
+                vec![0x1b, b'[', b'M', 97, 33, 33]
+            );
+            assert_eq!(
+                encode_mouse_with_state(
+                    &mouse_record(0, 0, 120u32 << 16, 0, MOUSE_HWHEELED),
+                    &state
+                )
+                .unwrap(),
+                vec![0x1b, b'[', b'M', 98, 33, 33]
             );
         }
 
@@ -2581,7 +2922,15 @@ mod windows_input_bridge_tests {
         use super::*;
         use std::path::PathBuf;
         use std::process::Command;
+        use std::sync::{MutexGuard, OnceLock};
         use std::time::Duration;
+
+        fn console_e2e_lock() -> MutexGuard<'static, ()> {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            LOCK.get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("console e2e lock poisoned")
+        }
 
         fn require_wezterm_pane_for_record_e2e() -> anyhow::Result<bool> {
             if std::env::var_os("WEZTERM_PANE").is_some() {
@@ -2627,10 +2976,22 @@ mod windows_input_bridge_tests {
             Ok(payload)
         }
 
+        fn wait_for_path(path: &std::path::Path) -> anyhow::Result<()> {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(10) {
+                if path.exists() {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            anyhow::bail!("timed out waiting for {}", path.display());
+        }
+
         #[test]
         #[ignore = "requires an interactive Windows console input buffer"]
         fn write_console_input_records_are_read_and_encoded_by_bridge_reader() -> anyhow::Result<()>
         {
+            let _guard = console_e2e_lock();
             let conin = OpenOptions::new().read(true).write(true).open("CONIN$")?;
             let conin_handle = conin.as_raw_handle() as *mut _;
             let mut original_mode = 0;
@@ -2724,6 +3085,7 @@ mod windows_input_bridge_tests {
             if !require_wezterm_pane_for_record_e2e()? {
                 return Ok(());
             }
+            let _guard = console_e2e_lock();
 
             let cast = tempfile::Builder::new()
                 .prefix("wezterm-record-win-input-e2e-")
@@ -2770,6 +3132,7 @@ mod windows_input_bridge_tests {
             if !require_wezterm_pane_for_record_e2e()? {
                 return Ok(());
             }
+            let _guard = console_e2e_lock();
 
             let cast = tempfile::Builder::new()
                 .prefix("wezterm-record-win-input-forward-e2e-")
@@ -2777,9 +3140,15 @@ mod windows_input_bridge_tests {
                 .tempfile()?
                 .into_temp_path();
             let cast_path = cast.to_path_buf();
+            let _ready_dir = tempfile::Builder::new()
+                .prefix("wezterm-record-win-input-ready-")
+                .tempdir()?;
+            let ready_path = _ready_dir.path().join("ready");
+            let ready_literal = ready_path.display().to_string().replace('\'', "''");
             let script = r#"
 $e=[char]27
 [Console]::Out.Write("${e}[?9001hINPUT_E2E_READY`r`n")
+[System.IO.File]::WriteAllText('__READY__', 'ready')
 $stdin=[Console]::OpenStandardInput()
 $buf=New-Object byte[] 128
 $task=$stdin.ReadAsync($buf, 0, $buf.Length)
@@ -2791,7 +3160,8 @@ if (-not $task.Wait(10000)) {
 $n=$task.Result
 $hex=($buf[0..($n - 1)] | ForEach-Object { $_.ToString('X2') }) -join ''
 [Console]::Out.Write("INPUT_E2E_HEX=$hex`r`n${e}[?9001l")
-"#;
+"#
+            .replace("__READY__", &ready_literal);
 
             let conin = OpenOptions::new().read(true).write(true).open("CONIN$")?;
             let conin_handle = conin.as_raw_handle() as *mut _;
@@ -2810,11 +3180,7 @@ $hex=($buf[0..($n - 1)] | ForEach-Object { $_.ToString('X2') }) -join ''
                 .arg(script)
                 .spawn()?;
 
-            // The cast file is finalized by `wezterm record` on exit, so it is
-            // not a reliable readiness signal while the child is still running.
-            // Give the recorder and child a moment to request Win32 input, then
-            // flush any typed test-command keys before injecting the sentinel.
-            std::thread::sleep(Duration::from_millis(4000));
+            wait_for_path(&ready_path)?;
             assert_ne!(unsafe { FlushConsoleInputBuffer(conin_handle) }, 0);
 
             let input = [
