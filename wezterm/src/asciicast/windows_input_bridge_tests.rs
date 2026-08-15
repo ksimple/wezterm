@@ -1,9 +1,8 @@
-
 use super::*;
 use std::fs::OpenOptions;
 use std::os::windows::io::AsRawHandle;
 use winapi::shared::minwindef::TRUE;
-use winapi::um::consoleapi::GetConsoleMode;
+use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
 use winapi::um::wincon::*;
 use winapi::um::winuser;
 
@@ -1958,6 +1957,10 @@ mod windows_console_integration {
         panic!("could not locate target debug wezterm.exe from current test executable");
     }
 
+    fn current_test_exe() -> PathBuf {
+        std::env::current_exe().expect("current test executable path")
+    }
+
     fn cast_payload(path: &std::path::Path) -> anyhow::Result<String> {
         let contents = std::fs::read_to_string(path)?;
         let mut payload = String::new();
@@ -1979,6 +1982,71 @@ mod windows_console_integration {
             std::thread::sleep(Duration::from_millis(50));
         }
         anyhow::bail!("timed out waiting for {}", path.display());
+    }
+
+    #[test]
+    fn synthetic_reply_child_probe() -> anyhow::Result<()> {
+        if std::env::var_os("WEZTERM_RECORD_SYNTHETIC_REPLY_CHILD").is_none() {
+            return Ok(());
+        }
+
+        let stdin = OpenOptions::new().read(true).write(true).open("CONIN$")?;
+        let stdin_handle = stdin.as_raw_handle() as *mut _;
+        let mut original_mode = 0;
+        assert_ne!(
+            unsafe { GetConsoleMode(stdin_handle, &mut original_mode) },
+            0
+        );
+        let probe_mode = (original_mode | ENABLE_VIRTUAL_TERMINAL_INPUT)
+            & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+        assert_ne!(unsafe { SetConsoleMode(stdin_handle, probe_mode) }, 0);
+
+        let mut stdout = std::io::stdout();
+        stdout.write_all(b"SYNTH_REPLY_PROBE_READY\r\n\x1b[c\x1b[>c\x1b[5n\x1b[6n")?;
+        stdout.flush()?;
+
+        let expected = b"\x1b[?1;0c\x1b[>0;0;0c\x1b[0n\x1b[1;1R";
+        let mut bytes = Vec::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = stdin;
+            loop {
+                let mut byte = [0u8; 1];
+                match reader.read(&mut byte) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if tx.send(byte[0]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !bytes.windows(expected.len()).any(|w| w == expected) {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(byte) => bytes.push(byte),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        let _ = unsafe { SetConsoleMode(stdin_handle, original_mode) };
+        let hex = bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        println!("SYNTH_REPLY_PROBE_HEX={hex}");
+        assert!(
+            bytes.windows(expected.len()).any(|w| w == expected),
+            "synthetic replies missing from child stdin bytes: {hex}",
+            hex = hex,
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -2209,6 +2277,58 @@ $hex=($buf[0..($n - 1)] | ForEach-Object { $_.ToString('X2') }) -join ''
         assert!(!payload.contains("\x1b[?9001h"));
         assert!(!payload.contains("\x1b[?9001l"));
         assert_ne!(unsafe { FlushConsoleInputBuffer(conin_handle) }, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "spawns wezterm record and requires an interactive Windows console"]
+    fn wezterm_record_win_input_on_sends_synthetic_query_replies_to_child() -> anyhow::Result<()> {
+        if !require_wezterm_pane_for_record_e2e()? {
+            return Ok(());
+        }
+        let _guard = console_e2e_lock();
+
+        let cast = tempfile::Builder::new()
+            .prefix("wezterm-record-win-input-replies-e2e-")
+            .suffix(".cast.txt")
+            .tempfile()?
+            .into_temp_path();
+        let cast_path = cast.to_path_buf();
+        let test_exe = current_test_exe();
+
+        let status = Command::new(debug_wezterm_exe())
+            .arg("record")
+            .arg("--win-input=on")
+            .arg("-o")
+            .arg(&cast_path)
+            .arg("--")
+            .arg(&test_exe)
+            .arg(
+                "asciicast::windows_input_bridge_tests::windows_console_integration::synthetic_reply_child_probe",
+            )
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("WEZTERM_RECORD_SYNTHETIC_REPLY_CHILD", "1")
+            .status()?;
+
+        assert!(
+            status.success(),
+            "wezterm record failed: status={:?}",
+            status.code()
+        );
+
+        let payload = cast_payload(&cast_path)?;
+        assert!(payload.contains("SYNTH_REPLY_PROBE_READY"));
+        assert!(
+            payload.contains("1B5B3F313B30631B5B3E303B303B30631B5B306E1B5B313B3152"),
+            "payload did not include expected synthetic query replies: {:?}",
+            payload
+        );
+        assert!(!payload.contains("\x1b[c"));
+        assert!(!payload.contains("\x1b[>c"));
+        assert!(!payload.contains("\x1b[5n"));
+        assert!(!payload.contains("\x1b[6n"));
 
         Ok(())
     }
