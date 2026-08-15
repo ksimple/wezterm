@@ -498,6 +498,62 @@ enum Message {
     Terminated(portable_pty::ExitStatus),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RecordLoopControl {
+    Continue,
+    Break,
+}
+
+#[derive(Debug, Default)]
+struct RecordLoopState {
+    child_status: Option<portable_pty::ExitStatus>,
+    stdout_eof: bool,
+    child_terminated_at: Option<Instant>,
+}
+
+trait RecordLoopIo {
+    fn write_stdin(&mut self, data: Vec<u8>) -> anyhow::Result<()>;
+    fn write_stdout(&mut self, data: Vec<u8>) -> anyhow::Result<()>;
+    fn resize(&mut self, size: PtySize) -> anyhow::Result<()>;
+    fn drain_pending_stdout(&mut self) -> anyhow::Result<()>;
+}
+
+fn process_record_message(
+    state: &mut RecordLoopState,
+    io: &mut impl RecordLoopIo,
+    msg: Message,
+    now: Instant,
+) -> anyhow::Result<RecordLoopControl> {
+    match msg {
+        Message::Stdin(data) => {
+            io.write_stdin(data)?;
+        }
+        Message::Stdout(data) => {
+            io.write_stdout(data)?;
+        }
+        Message::StdoutEof => {
+            state.stdout_eof = true;
+            if state.child_status.is_some() {
+                io.drain_pending_stdout()?;
+                return Ok(RecordLoopControl::Break);
+            }
+        }
+        Message::Resize(size) => {
+            io.resize(size)?;
+        }
+        Message::Terminated(status) => {
+            state.child_status.replace(status);
+            state.child_terminated_at = Some(now);
+            if state.stdout_eof {
+                io.drain_pending_stdout()?;
+                return Ok(RecordLoopControl::Break);
+            }
+        }
+    }
+
+    Ok(RecordLoopControl::Continue)
+}
+
 const STDOUT_DRAIN_AFTER_CHILD_EXIT: Duration = Duration::from_millis(500);
 
 fn stdout_drain_timeout_after_child_exit(
@@ -1458,6 +1514,63 @@ mod windows_input_bridge_tests {
     mod tracker_and_run_loop {
         use super::*;
 
+        #[derive(Default)]
+        struct TestRecordLoopIo {
+            stdin_writes: Vec<Vec<u8>>,
+            stdout_writes: Vec<Vec<u8>>,
+            resizes: Vec<PtySize>,
+            tracker: Option<InputModeTracker>,
+        }
+
+        impl TestRecordLoopIo {
+            fn with_tracker(tracker: InputModeTracker) -> Self {
+                Self {
+                    tracker: Some(tracker),
+                    ..Default::default()
+                }
+            }
+        }
+
+        impl RecordLoopIo for TestRecordLoopIo {
+            fn write_stdin(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
+                self.stdin_writes.push(data);
+                Ok(())
+            }
+
+            fn write_stdout(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
+                let data = if let Some(tracker) = self.tracker.as_mut() {
+                    let mut responses = Vec::new();
+                    let data =
+                        filter_child_output_for_outer_terminal(tracker, &data, &mut responses)?;
+                    if !responses.is_empty() {
+                        self.stdin_writes.push(responses);
+                    }
+                    data
+                } else {
+                    data
+                };
+                if !data.is_empty() {
+                    self.stdout_writes.push(data);
+                }
+                Ok(())
+            }
+
+            fn resize(&mut self, size: PtySize) -> anyhow::Result<()> {
+                self.resizes.push(size);
+                Ok(())
+            }
+
+            fn drain_pending_stdout(&mut self) -> anyhow::Result<()> {
+                if let Some(tracker) = self.tracker.as_mut() {
+                    let data = tracker.drain_pending();
+                    if !data.is_empty() {
+                        self.stdout_writes.push(data);
+                    }
+                }
+                Ok(())
+            }
+        }
+
         #[test]
         fn filters_owned_input_modes_and_updates_state() {
             let (state, mut tracker) = tracker();
@@ -2004,6 +2117,128 @@ mod windows_input_bridge_tests {
             assert_eq!(
                 stdout_drain_timeout_after_child_exit(true, false, Some(child_exit), after_grace),
                 Some(Duration::ZERO)
+            );
+        }
+
+        #[test]
+        fn record_loop_waits_for_stdout_eof_after_termination() {
+            let mut state = RecordLoopState::default();
+            let mut io = TestRecordLoopIo::default();
+            let now = Instant::now();
+
+            assert_eq!(
+                process_record_message(
+                    &mut state,
+                    &mut io,
+                    Message::Terminated(portable_pty::ExitStatus::with_exit_code(0)),
+                    now,
+                )
+                .unwrap(),
+                RecordLoopControl::Continue
+            );
+            assert!(state.child_status.is_some());
+            assert!(!state.stdout_eof);
+
+            assert_eq!(
+                process_record_message(
+                    &mut state,
+                    &mut io,
+                    Message::Stdout(b"late".to_vec()),
+                    now,
+                )
+                .unwrap(),
+                RecordLoopControl::Continue
+            );
+            assert_eq!(io.stdout_writes, vec![b"late".to_vec()]);
+
+            assert_eq!(
+                process_record_message(&mut state, &mut io, Message::StdoutEof, now).unwrap(),
+                RecordLoopControl::Break
+            );
+        }
+
+        #[test]
+        fn record_loop_drains_pending_tracker_output_when_stdout_eof_follows_termination() {
+            let (_state, tracker) = tracker();
+            let mut state = RecordLoopState::default();
+            let mut io = TestRecordLoopIo::with_tracker(tracker);
+            let now = Instant::now();
+
+            assert_eq!(
+                process_record_message(
+                    &mut state,
+                    &mut io,
+                    Message::Stdout(b"\x1b[?".to_vec()),
+                    now,
+                )
+                .unwrap(),
+                RecordLoopControl::Continue
+            );
+            assert!(io.stdout_writes.is_empty());
+
+            assert_eq!(
+                process_record_message(
+                    &mut state,
+                    &mut io,
+                    Message::Terminated(portable_pty::ExitStatus::with_exit_code(0)),
+                    now,
+                )
+                .unwrap(),
+                RecordLoopControl::Continue
+            );
+            assert_eq!(
+                process_record_message(&mut state, &mut io, Message::StdoutEof, now).unwrap(),
+                RecordLoopControl::Break
+            );
+            assert_eq!(io.stdout_writes, vec![b"\x1b[?".to_vec()]);
+        }
+
+        #[test]
+        fn record_loop_delivers_resize_messages_to_master() {
+            let mut state = RecordLoopState::default();
+            let mut io = TestRecordLoopIo::default();
+            let size = PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            };
+
+            assert_eq!(
+                process_record_message(&mut state, &mut io, Message::Resize(size), Instant::now())
+                    .unwrap(),
+                RecordLoopControl::Continue
+            );
+            assert_eq!(io.resizes, vec![size]);
+        }
+
+        #[test]
+        fn record_loop_writes_query_responses_before_later_user_input() {
+            let (_state, tracker) = tracker();
+            let mut state = RecordLoopState::default();
+            let mut io = TestRecordLoopIo::with_tracker(tracker);
+            let now = Instant::now();
+
+            assert_eq!(
+                process_record_message(
+                    &mut state,
+                    &mut io,
+                    Message::Stdout(b"\x1b[6n".to_vec()),
+                    now,
+                )
+                .unwrap(),
+                RecordLoopControl::Continue
+            );
+            assert_eq!(
+                process_record_message(&mut state, &mut io, Message::Stdin(b"user".to_vec()), now,)
+                    .unwrap(),
+                RecordLoopControl::Continue
+            );
+
+            assert_eq!(io.stdout_writes, Vec::<Vec<u8>>::new());
+            assert_eq!(
+                io.stdin_writes,
+                vec![b"\x1b[1;1R".to_vec(), b"user".to_vec()]
             );
         }
 
@@ -3244,6 +3479,56 @@ pub struct RecordCommand {
     prog: Vec<OsString>,
 }
 
+struct RecordLoopRuntimeIo<'a, W: Write> {
+    writer: &'a mut dyn Write,
+    master: &'a mut dyn portable_pty::MasterPty,
+    tty: &'a mut Tty,
+    cast_file: &'a mut W,
+    buffer: &'a mut Vec<u8>,
+    first_output: Instant,
+    #[cfg(windows)]
+    input_mode_tracker: &'a mut Option<InputModeTracker>,
+}
+
+impl<W: Write> RecordLoopIo for RecordLoopRuntimeIo<'_, W> {
+    fn write_stdin(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
+        self.writer.write_all(&data)?;
+        Ok(())
+    }
+
+    fn write_stdout(&mut self, mut data: Vec<u8>) -> anyhow::Result<()> {
+        let elapsed = self.first_output.elapsed().as_secs_f32();
+        #[cfg(windows)]
+        if let Some(tracker) = self.input_mode_tracker.as_mut() {
+            data = filter_child_output_for_outer_terminal(tracker, &data, &mut self.writer)?;
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.tty.write_all(&data)?;
+        log_utf8_output(self.cast_file, self.buffer, elapsed, &mut data)?;
+        Ok(())
+    }
+
+    fn resize(&mut self, size: PtySize) -> anyhow::Result<()> {
+        self.master.resize(size)?;
+        Ok(())
+    }
+
+    fn drain_pending_stdout(&mut self) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        if let Some(tracker) = self.input_mode_tracker.as_mut() {
+            let mut data = tracker.drain_pending();
+            if !data.is_empty() {
+                let elapsed = self.first_output.elapsed().as_secs_f32();
+                self.tty.write_all(&data)?;
+                log_utf8_output(self.cast_file, self.buffer, elapsed, &mut data)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl RecordCommand {
     pub fn run(&self, config: ConfigHandle) -> anyhow::Result<()> {
         let prog = self.prog.iter().map(|s| s.as_os_str()).collect::<Vec<_>>();
@@ -3275,7 +3560,7 @@ impl RecordCommand {
         writeln!(cast_file, "{}", serde_json::to_string(&header)?)?;
 
         let pty_system = native_pty_system();
-        let pair = pty_system.openpty(size)?;
+        let mut pair = pty_system.openpty(size)?;
 
         let cmd = config.build_prog(
             if self.prog.is_empty() {
@@ -3409,20 +3694,28 @@ impl RecordCommand {
             });
         }
 
-        let mut child_status = None;
         let first_output = Instant::now();
         let mut buffer = vec![];
         let mut writer = pair.master.take_writer()?;
-        let mut stdout_eof = false;
-        let mut child_terminated_at = None;
+        let mut loop_state = RecordLoopState::default();
+        let mut loop_io = RecordLoopRuntimeIo {
+            writer: writer.as_mut(),
+            master: pair.master.as_mut(),
+            tty: &mut tty,
+            cast_file: &mut cast_file,
+            buffer: &mut buffer,
+            first_output,
+            #[cfg(windows)]
+            input_mode_tracker: &mut input_mode_tracker,
+        };
 
         loop {
-            let msg = if child_status.is_some() && !stdout_eof {
+            let msg = if loop_state.child_status.is_some() && !loop_state.stdout_eof {
                 match rx.recv_timeout(
                     stdout_drain_timeout_after_child_exit(
                         true,
-                        stdout_eof,
-                        child_terminated_at,
+                        loop_state.stdout_eof,
+                        loop_state.child_terminated_at,
                         Instant::now(),
                     )
                     .unwrap_or_default(),
@@ -3437,75 +3730,22 @@ impl RecordCommand {
                 }
             };
 
-            match msg {
-                Message::Stdin(data) => {
-                    writer.write_all(&data)?;
-                }
-                Message::Stdout(mut data) => {
-                    let elapsed = first_output.elapsed().as_secs_f32();
-                    #[cfg(windows)]
-                    if let Some(tracker) = input_mode_tracker.as_mut() {
-                        data = filter_child_output_for_outer_terminal(tracker, &data, &mut writer)?;
-                    }
-                    if data.is_empty() {
-                        continue;
-                    }
-                    tty.write_all(&data)?;
-                    log_utf8_output(&mut cast_file, &mut buffer, elapsed, &mut data)?;
-                }
-                Message::StdoutEof => {
-                    stdout_eof = true;
-                    if child_status.is_some() {
-                        #[cfg(windows)]
-                        if let Some(tracker) = input_mode_tracker.as_mut() {
-                            let mut data = tracker.drain_pending();
-                            if !data.is_empty() {
-                                let elapsed = first_output.elapsed().as_secs_f32();
-                                tty.write_all(&data)?;
-                                log_utf8_output(&mut cast_file, &mut buffer, elapsed, &mut data)?;
-                            }
-                        }
-                        break;
-                    }
-                }
-                Message::Resize(size) => {
-                    pair.master.resize(size)?;
-                }
-                Message::Terminated(status) => {
-                    child_status.replace(status);
-                    child_terminated_at = Some(Instant::now());
-                    if stdout_eof {
-                        #[cfg(windows)]
-                        if let Some(tracker) = input_mode_tracker.as_mut() {
-                            let mut data = tracker.drain_pending();
-                            if !data.is_empty() {
-                                let elapsed = first_output.elapsed().as_secs_f32();
-                                tty.write_all(&data)?;
-                                log_utf8_output(&mut cast_file, &mut buffer, elapsed, &mut data)?;
-                            }
-                        }
-                        break;
-                    }
-                }
+            if process_record_message(&mut loop_state, &mut loop_io, msg, Instant::now())?
+                == RecordLoopControl::Break
+            {
+                break;
             }
         }
 
-        #[cfg(windows)]
-        if let Some(tracker) = input_mode_tracker.as_mut() {
-            let mut data = tracker.drain_pending();
-            if !data.is_empty() {
-                let elapsed = first_output.elapsed().as_secs_f32();
-                tty.write_all(&data)?;
-                log_utf8_output(&mut cast_file, &mut buffer, elapsed, &mut data)?;
-            }
-        }
+        loop_io.drain_pending_stdout()?;
+        drop(loop_io);
 
         #[cfg(windows)]
         if use_win_input_bridge {
             let _ = tty.reset_outer_input_modes();
         }
         tty.set_cooked()?;
-        eprintln!("Child status: {:?}", child_status);
+        eprintln!("Child status: {:?}", loop_state.child_status);
         cast_file.flush()?;
         eprintln!("*** Finished recording to {}", cast_file_name.display());
 
