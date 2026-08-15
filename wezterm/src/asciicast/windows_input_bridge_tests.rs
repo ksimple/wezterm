@@ -682,6 +682,35 @@ mod tracker_and_run_loop {
     }
 
     #[test]
+    fn terminal_queries_work_when_streamed_one_byte_at_a_time() {
+        for (query, response) in [
+            (b"\x1b[c".as_slice(), b"\x1b[?1;0c".as_slice()),
+            (b"\x1b[0c", b"\x1b[?1;0c"),
+            (b"\x1b[>c", b"\x1b[>0;0;0c"),
+            (b"\x1b[>0c", b"\x1b[>0;0;0c"),
+            (b"\x1b[5n", b"\x1b[0n"),
+            (b"\x1b[6n", b"\x1b[1;1R"),
+        ] {
+            let (_state, mut tracker) = tracker();
+            let mut responses = Vec::new();
+
+            for (idx, byte) in query.iter().enumerate() {
+                let (output, next_responses) = tracker.filter_and_get_responses(&[*byte]);
+                assert_eq!(output, b"");
+                if idx + 1 == query.len() {
+                    assert_eq!(next_responses, response);
+                } else {
+                    assert_eq!(next_responses, b"");
+                }
+                responses.extend_from_slice(&next_responses);
+            }
+
+            assert_eq!(responses, response);
+            assert_eq!(tracker.drain_pending(), b"");
+        }
+    }
+
+    #[test]
     fn child_output_filter_writes_query_responses_without_outer_output() {
         let (_state, mut tracker) = tracker();
         let mut child_input = Vec::new();
@@ -1914,7 +1943,7 @@ mod focus {
 mod windows_console_integration {
     use super::*;
     use std::path::PathBuf;
-    use std::process::Command;
+    use std::process::{Child, Command, ExitStatus};
     use std::sync::{MutexGuard, OnceLock};
     use std::time::Duration;
 
@@ -1961,6 +1990,154 @@ mod windows_console_integration {
         std::env::current_exe().expect("current test executable path")
     }
 
+    struct ConsoleModeGuard {
+        conin: std::fs::File,
+        original_mode: u32,
+        restored: bool,
+    }
+
+    impl ConsoleModeGuard {
+        fn save_conin() -> anyhow::Result<Self> {
+            let conin = OpenOptions::new().read(true).write(true).open("CONIN$")?;
+            let mut original_mode = 0;
+            if unsafe { GetConsoleMode(conin.as_raw_handle() as *mut _, &mut original_mode) } == 0 {
+                anyhow::bail!(
+                    "GetConsoleMode(CONIN$) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            Ok(Self {
+                conin,
+                original_mode,
+                restored: false,
+            })
+        }
+
+        fn set_conin_mode(mode: u32) -> anyhow::Result<Self> {
+            let mut guard = Self::save_conin()?;
+            guard.set_mode(mode)?;
+            Ok(guard)
+        }
+
+        fn handle(&self) -> *mut winapi::ctypes::c_void {
+            self.conin.as_raw_handle() as *mut _
+        }
+
+        fn original_mode(&self) -> u32 {
+            self.original_mode
+        }
+
+        fn set_mode(&mut self, mode: u32) -> anyhow::Result<()> {
+            if unsafe { SetConsoleMode(self.handle(), mode) } == 0 {
+                anyhow::bail!(
+                    "SetConsoleMode(CONIN$) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            Ok(())
+        }
+
+        fn restore(&mut self) -> anyhow::Result<()> {
+            if !self.restored {
+                if unsafe { SetConsoleMode(self.handle(), self.original_mode) } == 0 {
+                    anyhow::bail!(
+                        "SetConsoleMode(CONIN$ restore) failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                self.restored = true;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for ConsoleModeGuard {
+        fn drop(&mut self) {
+            if !self.restored && unsafe { SetConsoleMode(self.handle(), self.original_mode) } == 0 {
+                eprintln!(
+                    "failed to restore CONIN$ mode: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    struct ChildGuard {
+        child: Option<Child>,
+    }
+
+    impl ChildGuard {
+        fn new(child: Child) -> Self {
+            Self { child: Some(child) }
+        }
+
+        fn wait_timeout(
+            &mut self,
+            timeout: Duration,
+            cast_path: &std::path::Path,
+        ) -> anyhow::Result<ExitStatus> {
+            let deadline = Instant::now() + timeout;
+            let child = self.child.as_mut().expect("child already reaped");
+            while Instant::now() < deadline {
+                if let Some(status) = child.try_wait()? {
+                    self.child = None;
+                    return Ok(status);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+
+            let _ = child.kill();
+            let _ = child.wait();
+            let payload = cast_payload(cast_path).unwrap_or_else(|err| {
+                format!("<failed to read cast {}: {err:#}>", cast_path.display())
+            });
+            anyhow::bail!(
+                "wezterm record timed out after {:?}; cast payload so far: {:?}",
+                timeout,
+                payload
+            );
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn spawn_record(command: &mut Command) -> anyhow::Result<ChildGuard> {
+        Ok(ChildGuard::new(command.spawn()?))
+    }
+
+    fn assert_record_success(
+        status: ExitStatus,
+        cast_path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        if status.success() {
+            return Ok(());
+        }
+
+        let payload = cast_payload(cast_path).unwrap_or_else(|err| {
+            format!("<failed to read cast {}: {err:#}>", cast_path.display())
+        });
+        anyhow::bail!(
+            "wezterm record failed: status={:?}; cast payload: {:?}",
+            status.code(),
+            payload
+        );
+    }
+
+    fn count_subslice(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|window| *window == needle)
+            .count()
+    }
+
     fn cast_payload(path: &std::path::Path) -> anyhow::Result<String> {
         let contents = std::fs::read_to_string(path)?;
         let mut payload = String::new();
@@ -1985,21 +2162,32 @@ mod windows_console_integration {
     }
 
     #[test]
+    #[ignore = "child entrypoint for wezterm record synthetic reply e2e"]
     fn synthetic_reply_child_probe() -> anyhow::Result<()> {
         if std::env::var_os("WEZTERM_RECORD_SYNTHETIC_REPLY_CHILD").is_none() {
             return Ok(());
         }
 
         let stdin = OpenOptions::new().read(true).write(true).open("CONIN$")?;
-        let stdin_handle = stdin.as_raw_handle() as *mut _;
-        let mut original_mode = 0;
-        assert_ne!(
-            unsafe { GetConsoleMode(stdin_handle, &mut original_mode) },
-            0
-        );
+        let original_mode = {
+            let mut original_mode = 0;
+            if unsafe { GetConsoleMode(stdin.as_raw_handle() as *mut _, &mut original_mode) } == 0 {
+                anyhow::bail!(
+                    "GetConsoleMode(CONIN$) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            original_mode
+        };
         let probe_mode = (original_mode | ENABLE_VIRTUAL_TERMINAL_INPUT)
             & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
-        assert_ne!(unsafe { SetConsoleMode(stdin_handle, probe_mode) }, 0);
+        let mut mode_guard = ConsoleModeGuard::set_conin_mode(probe_mode)?;
+        if unsafe { FlushConsoleInputBuffer(mode_guard.handle()) } == 0 {
+            anyhow::bail!(
+                "FlushConsoleInputBuffer(CONIN$) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
 
         let mut stdout = std::io::stdout();
         stdout.write_all(b"SYNTH_REPLY_PROBE_READY\r\n\x1b[c\x1b[>c\x1b[5n\x1b[6n")?;
@@ -2026,23 +2214,55 @@ mod windows_console_integration {
         });
 
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && !bytes.windows(expected.len()).any(|w| w == expected) {
-            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        let quiet = Duration::from_millis(250);
+        let mut saw_expected = false;
+        while Instant::now() < deadline {
+            let wait = if saw_expected {
+                quiet
+            } else {
+                deadline.saturating_duration_since(Instant::now())
+            };
+
+            match rx.recv_timeout(wait) {
                 Ok(byte) => bytes.push(byte),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if saw_expected => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
+
+            saw_expected = bytes.windows(expected.len()).any(|w| w == expected);
         }
 
-        let _ = unsafe { SetConsoleMode(stdin_handle, original_mode) };
+        mode_guard.restore()?;
         let hex = bytes
             .iter()
             .map(|byte| format!("{byte:02X}"))
             .collect::<String>();
         println!("SYNTH_REPLY_PROBE_HEX={hex}");
+
+        let Some(reply_start) = bytes.windows(expected.len()).position(|w| w == expected) else {
+            anyhow::bail!(
+                "synthetic replies missing from child stdin bytes: {hex}",
+                hex = hex,
+            );
+        };
+        assert_eq!(
+            count_subslice(&bytes, expected),
+            1,
+            "synthetic replies appeared more than once in child stdin bytes: {hex}",
+            hex = hex,
+        );
         assert!(
-            bytes.windows(expected.len()).any(|w| w == expected),
-            "synthetic replies missing from child stdin bytes: {hex}",
+            bytes[..reply_start]
+                .iter()
+                .all(|byte| matches!(*byte, b'\r' | b'\n')),
+            "unexpected bytes before synthetic replies in child stdin: {hex}",
+            hex = hex,
+        );
+        assert_eq!(
+            &bytes[reply_start + expected.len()..],
+            b"",
+            "unexpected bytes after synthetic replies in child stdin: {hex}",
             hex = hex,
         );
 
@@ -2055,11 +2275,7 @@ mod windows_console_integration {
         let _guard = console_e2e_lock();
         let conin = OpenOptions::new().read(true).write(true).open("CONIN$")?;
         let conin_handle = conin.as_raw_handle() as *mut _;
-        let mut original_mode = 0;
-        assert_ne!(
-            unsafe { GetConsoleMode(conin_handle, &mut original_mode) },
-            0
-        );
+        let mut mode_guard = ConsoleModeGuard::save_conin()?;
         assert_ne!(unsafe { FlushConsoleInputBuffer(conin_handle) }, 0);
 
         let mut tty = super::super::win::WinTty::new()?;
@@ -2129,12 +2345,13 @@ mod windows_console_integration {
         );
 
         tty.set_cooked()?;
+        mode_guard.restore()?;
         let mut restored_mode = 0;
         assert_ne!(
             unsafe { GetConsoleMode(conin_handle, &mut restored_mode) },
             0
         );
-        assert_eq!(restored_mode, original_mode);
+        assert_eq!(restored_mode, mode_guard.original_mode());
         assert_ne!(unsafe { FlushConsoleInputBuffer(conin_handle) }, 0);
 
         Ok(())
@@ -2156,7 +2373,8 @@ mod windows_console_integration {
         let cast_path = cast.to_path_buf();
         let script = "$e=[char]27; [Console]::Out.Write(\"${e}[?9001h${e}[?1006h${e}[?25hE2E_CAST_MARK${e}[?25l${e}[?1006l${e}[?9001l`r`n\")";
 
-        let status = Command::new(debug_wezterm_exe())
+        let mut command = Command::new(debug_wezterm_exe());
+        command
             .arg("record")
             .arg("--win-input=on")
             .arg("-o")
@@ -2166,14 +2384,10 @@ mod windows_console_integration {
             .arg("-NoProfile")
             .arg("-NonInteractive")
             .arg("-Command")
-            .arg(script)
-            .status()?;
-
-        assert!(
-            status.success(),
-            "wezterm record failed: status={:?}",
-            status.code()
-        );
+            .arg(script);
+        let status =
+            spawn_record(&mut command)?.wait_timeout(Duration::from_secs(30), &cast_path)?;
+        assert_record_success(status, &cast_path)?;
 
         let payload = cast_payload(&cast_path)?;
         assert!(payload.contains("E2E_CAST_MARK"));
@@ -2228,7 +2442,8 @@ $hex=($buf[0..($n - 1)] | ForEach-Object { $_.ToString('X2') }) -join ''
         let conin_handle = conin.as_raw_handle() as *mut _;
         assert_ne!(unsafe { FlushConsoleInputBuffer(conin_handle) }, 0);
 
-        let mut child = Command::new(debug_wezterm_exe())
+        let mut command = Command::new(debug_wezterm_exe());
+        command
             .arg("record")
             .arg("--win-input=on")
             .arg("-o")
@@ -2238,8 +2453,8 @@ $hex=($buf[0..($n - 1)] | ForEach-Object { $_.ToString('X2') }) -join ''
             .arg("-NoProfile")
             .arg("-NonInteractive")
             .arg("-Command")
-            .arg(script)
-            .spawn()?;
+            .arg(script);
+        let mut child = spawn_record(&mut command)?;
 
         wait_for_path(&ready_path)?;
         assert_ne!(unsafe { FlushConsoleInputBuffer(conin_handle) }, 0);
@@ -2260,12 +2475,8 @@ $hex=($buf[0..($n - 1)] | ForEach-Object { $_.ToString('X2') }) -join ''
         assert_ne!(ok, 0);
         assert_eq!(written, input.len() as u32);
 
-        let status = child.wait()?;
-        assert!(
-            status.success(),
-            "wezterm record failed: status={:?}",
-            status.code()
-        );
+        let status = child.wait_timeout(Duration::from_secs(30), &cast_path)?;
+        assert_record_success(status, &cast_path)?;
 
         let payload = cast_payload(&cast_path)?;
         assert!(payload.contains("INPUT_E2E_READY"));
@@ -2297,7 +2508,8 @@ $hex=($buf[0..($n - 1)] | ForEach-Object { $_.ToString('X2') }) -join ''
         let cast_path = cast.to_path_buf();
         let test_exe = current_test_exe();
 
-        let status = Command::new(debug_wezterm_exe())
+        let mut command = Command::new(debug_wezterm_exe());
+        command
             .arg("record")
             .arg("--win-input=on")
             .arg("-o")
@@ -2308,15 +2520,12 @@ $hex=($buf[0..($n - 1)] | ForEach-Object { $_.ToString('X2') }) -join ''
                 "asciicast::windows_input_bridge_tests::windows_console_integration::synthetic_reply_child_probe",
             )
             .arg("--exact")
+            .arg("--ignored")
             .arg("--nocapture")
-            .env("WEZTERM_RECORD_SYNTHETIC_REPLY_CHILD", "1")
-            .status()?;
-
-        assert!(
-            status.success(),
-            "wezterm record failed: status={:?}",
-            status.code()
-        );
+            .env("WEZTERM_RECORD_SYNTHETIC_REPLY_CHILD", "1");
+        let status =
+            spawn_record(&mut command)?.wait_timeout(Duration::from_secs(30), &cast_path)?;
+        assert_record_success(status, &cast_path)?;
 
         let payload = cast_payload(&cast_path)?;
         assert!(payload.contains("SYNTH_REPLY_PROBE_READY"));
