@@ -1,7 +1,7 @@
 use anyhow::Context;
 use chrono::serde::ts_seconds_option;
 use chrono::{DateTime, Utc};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use config::ConfigHandle;
 use filedescriptor::FileDescriptor;
 use portable_pty::{native_pty_system, PtySize};
@@ -10,9 +10,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, RecvTimeoutError};
-#[cfg(windows)]
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 use termwiz::escape::parser::Parser as TWParser;
 use termwiz::escape::Action;
@@ -134,38 +132,6 @@ impl Event {
     }
 }
 
-fn log_utf8_output<W: Write>(
-    cast_file: &mut W,
-    buffer: &mut Vec<u8>,
-    elapsed: f32,
-    data: &mut Vec<u8>,
-) -> anyhow::Result<()> {
-    // The end of the data may be an incomplete utf8 sequence that straddles
-    // the buffer boundary. JSON requires strings to be utf-8, so log only
-    // valid portions and carry the remainder forward.
-    buffer.append(data);
-    match std::str::from_utf8(buffer) {
-        Ok(valid) => {
-            Event::log_output(cast_file, elapsed, valid)?;
-            buffer.clear();
-        }
-        Err(error) => {
-            let valid_len = error.valid_up_to();
-            Event::log_output(cast_file, elapsed, unsafe {
-                std::str::from_utf8_unchecked(&buffer[0..valid_len])
-            })?;
-
-            buffer.drain(0..valid_len);
-
-            if let Some(invalid_sequence_length) = error.error_len() {
-                // Invalid sequence: skip it.
-                buffer.drain(0..invalid_sequence_length);
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(windows)]
 mod win {
     use super::*;
@@ -175,13 +141,6 @@ mod win {
     use winapi::um::consoleapi::*;
     use winapi::um::wincon::*;
     use winapi::um::winnls::CP_UTF8;
-
-    fn check_bool(ok: i32, context: &str) -> anyhow::Result<()> {
-        if ok == 0 {
-            anyhow::bail!("{context}: {}", std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
 
     pub struct WinTty {
         saved_input: u32,
@@ -202,16 +161,10 @@ mod win {
             let mut saved_output = 0;
             let saved_cp;
             unsafe {
-                check_bool(
-                    GetConsoleMode(read.as_raw_file_descriptor() as *mut _, &mut saved_input),
-                    "GetConsoleMode(CONIN$) failed",
-                )?;
-                check_bool(
-                    GetConsoleMode(write.as_raw_file_descriptor() as *mut _, &mut saved_output),
-                    "GetConsoleMode(CONOUT$) failed",
-                )?;
+                GetConsoleMode(read.as_raw_file_descriptor() as *mut _, &mut saved_input);
+                GetConsoleMode(write.as_raw_file_descriptor() as *mut _, &mut saved_output);
                 saved_cp = GetConsoleOutputCP();
-                check_bool(SetConsoleOutputCP(CP_UTF8), "SetConsoleOutputCP failed")?;
+                SetConsoleOutputCP(CP_UTF8);
             }
 
             Ok(Self {
@@ -225,72 +178,28 @@ mod win {
 
         pub fn set_cooked(&mut self) -> anyhow::Result<()> {
             unsafe {
-                check_bool(
-                    SetConsoleOutputCP(self.saved_cp),
-                    "SetConsoleOutputCP failed",
-                )?;
-                check_bool(
-                    SetConsoleMode(self.read.as_raw_handle() as *mut _, self.saved_input),
-                    "SetConsoleMode(CONIN$ restore) failed",
-                )?;
-                check_bool(
-                    SetConsoleMode(self.write.as_raw_handle() as *mut _, self.saved_output),
-                    "SetConsoleMode(CONOUT$ restore) failed",
-                )?;
+                SetConsoleOutputCP(self.saved_cp);
+                SetConsoleMode(self.read.as_raw_handle() as *mut _, self.saved_input);
+                SetConsoleMode(self.write.as_raw_handle() as *mut _, self.saved_output);
             }
             Ok(())
         }
 
         pub fn set_raw(&mut self) -> anyhow::Result<()> {
             unsafe {
-                check_bool(
-                    SetConsoleMode(
-                        self.read.as_raw_file_descriptor() as *mut _,
-                        ENABLE_VIRTUAL_TERMINAL_INPUT,
-                    ),
-                    "SetConsoleMode(CONIN$ raw) failed",
-                )?;
-                check_bool(
-                    SetConsoleMode(
-                        self.write.as_raw_file_descriptor() as *mut _,
-                        ENABLE_PROCESSED_OUTPUT
-                            | ENABLE_WRAP_AT_EOL_OUTPUT
-                            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-                            | DISABLE_NEWLINE_AUTO_RETURN,
-                    ),
-                    "SetConsoleMode(CONOUT$ raw) failed",
-                )?;
+                SetConsoleMode(
+                    self.read.as_raw_file_descriptor() as *mut _,
+                    ENABLE_VIRTUAL_TERMINAL_INPUT,
+                );
+                SetConsoleMode(
+                    self.write.as_raw_file_descriptor() as *mut _,
+                    ENABLE_PROCESSED_OUTPUT
+                        | ENABLE_WRAP_AT_EOL_OUTPUT
+                        | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                        | DISABLE_NEWLINE_AUTO_RETURN,
+                );
             }
             Ok(())
-        }
-
-        pub fn set_bridge_mode(&mut self) -> anyhow::Result<()> {
-            unsafe {
-                check_bool(
-                    SetConsoleMode(
-                        self.read.as_raw_file_descriptor() as *mut _,
-                        ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT,
-                    ),
-                    "SetConsoleMode(CONIN$ bridge) failed",
-                )?;
-                check_bool(
-                    SetConsoleMode(
-                        self.write.as_raw_file_descriptor() as *mut _,
-                        ENABLE_PROCESSED_OUTPUT
-                            | ENABLE_WRAP_AT_EOL_OUTPUT
-                            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-                            | DISABLE_NEWLINE_AUTO_RETURN,
-                    ),
-                    "SetConsoleMode(CONOUT$ bridge) failed",
-                )?;
-            }
-            Ok(())
-        }
-
-        pub fn reset_outer_input_modes(&mut self) -> anyhow::Result<()> {
-            self.write_all(
-                b"\x1b[?1l\x1b[?9001l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l",
-            )
         }
 
         pub fn get_size(&self) -> anyhow::Result<PtySize> {
@@ -323,13 +232,6 @@ mod win {
             Ok(self.read.try_clone()?)
         }
 
-        pub fn input_reader(&self) -> anyhow::Result<WinInputReader> {
-            Ok(WinInputReader {
-                read: self.read.try_clone()?,
-                write: self.write.try_clone()?,
-            })
-        }
-
         pub fn write_all(&mut self, data: &[u8]) -> anyhow::Result<()> {
             Ok(self.write.write_all(data)?)
         }
@@ -338,67 +240,6 @@ mod win {
     impl Drop for WinTty {
         fn drop(&mut self) {
             let _ = self.set_cooked();
-        }
-    }
-
-    pub struct WinInputReader {
-        read: FileDescriptor,
-        write: FileDescriptor,
-    }
-
-    impl WinInputReader {
-        pub fn get_size(&self) -> anyhow::Result<PtySize> {
-            let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
-            let ok = unsafe {
-                GetConsoleScreenBufferInfo(
-                    self.write.as_raw_handle() as *mut _,
-                    &mut info as *mut _,
-                )
-            };
-            if ok == 0 {
-                anyhow::bail!(
-                    "GetConsoleScreenBufferInfo failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-
-            let cols = 1 + (info.srWindow.Right - info.srWindow.Left);
-            let rows = 1 + (info.srWindow.Bottom - info.srWindow.Top);
-
-            Ok(PtySize {
-                rows: rows as u16,
-                cols: cols as u16,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-        }
-
-        pub fn read_console_input(
-            &mut self,
-            num_events: usize,
-        ) -> anyhow::Result<Vec<INPUT_RECORD>> {
-            let mut records = Vec::with_capacity(num_events);
-            let empty_record: INPUT_RECORD = unsafe { std::mem::zeroed() };
-            records.resize(num_events, empty_record);
-
-            let mut num_read = 0;
-            if unsafe {
-                ReadConsoleInputW(
-                    self.read.as_raw_handle() as *mut _,
-                    records.as_mut_ptr(),
-                    num_events as u32,
-                    &mut num_read,
-                )
-            } == 0
-            {
-                anyhow::bail!(
-                    "ReadConsoleInputW failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-
-            unsafe { records.set_len(num_read as usize) };
-            Ok(records)
         }
     }
 }
@@ -490,716 +331,9 @@ enum Message {
     Stdin(Vec<u8>),
     /// Output from the child tty
     Stdout(Vec<u8>),
-    /// Child tty output reached EOF
-    StdoutEof,
-    /// Terminal window size changed
-    Resize(PtySize),
     /// Child process terminated
     Terminated(portable_pty::ExitStatus),
 }
-
-#[derive(Debug, PartialEq, Eq)]
-enum RecordLoopControl {
-    Continue,
-    Break,
-}
-
-#[derive(Debug, Default)]
-struct RecordLoopState {
-    child_status: Option<portable_pty::ExitStatus>,
-    stdout_eof: bool,
-    child_terminated_at: Option<Instant>,
-}
-
-trait RecordLoopIo {
-    fn write_stdin(&mut self, data: Vec<u8>) -> anyhow::Result<()>;
-    fn write_stdout(&mut self, data: Vec<u8>) -> anyhow::Result<()>;
-    fn resize(&mut self, size: PtySize) -> anyhow::Result<()>;
-    fn drain_pending_stdout(&mut self) -> anyhow::Result<()>;
-}
-
-fn process_record_message(
-    state: &mut RecordLoopState,
-    io: &mut impl RecordLoopIo,
-    msg: Message,
-    now: Instant,
-) -> anyhow::Result<RecordLoopControl> {
-    match msg {
-        Message::Stdin(data) => {
-            io.write_stdin(data)?;
-        }
-        Message::Stdout(data) => {
-            io.write_stdout(data)?;
-        }
-        Message::StdoutEof => {
-            state.stdout_eof = true;
-            if state.child_status.is_some() {
-                io.drain_pending_stdout()?;
-                return Ok(RecordLoopControl::Break);
-            }
-        }
-        Message::Resize(size) => {
-            io.resize(size)?;
-        }
-        Message::Terminated(status) => {
-            state.child_status.replace(status);
-            state.child_terminated_at = Some(now);
-            if state.stdout_eof {
-                io.drain_pending_stdout()?;
-                return Ok(RecordLoopControl::Break);
-            }
-        }
-    }
-
-    Ok(RecordLoopControl::Continue)
-}
-
-const STDOUT_DRAIN_AFTER_CHILD_EXIT: Duration = Duration::from_millis(500);
-
-fn stdout_drain_timeout_after_child_exit(
-    child_status_known: bool,
-    stdout_eof: bool,
-    child_terminated_at: Option<Instant>,
-    now: Instant,
-) -> Option<Duration> {
-    if !child_status_known || stdout_eof {
-        return None;
-    }
-
-    Some(
-        child_terminated_at
-            .unwrap_or(now)
-            .checked_add(STDOUT_DRAIN_AFTER_CHILD_EXIT)
-            .unwrap_or(now)
-            .saturating_duration_since(now),
-    )
-}
-
-#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
-enum WinInputMode {
-    #[default]
-    Auto,
-    On,
-    Off,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowsInputBridgeAction {
-    SetRaw,
-    SetBridgeMode,
-}
-
-#[cfg(windows)]
-fn configure_windows_input_bridge(
-    win_input: WinInputMode,
-    mut configure: impl FnMut(WindowsInputBridgeAction) -> anyhow::Result<()>,
-    mut warn: impl FnMut(&anyhow::Error),
-) -> anyhow::Result<bool> {
-    match win_input {
-        WinInputMode::Off => {
-            configure(WindowsInputBridgeAction::SetRaw)?;
-            Ok(false)
-        }
-        WinInputMode::Auto => match configure(WindowsInputBridgeAction::SetBridgeMode) {
-            Ok(()) => Ok(true),
-            Err(err) => {
-                warn(&err);
-                configure(WindowsInputBridgeAction::SetRaw)?;
-                Ok(false)
-            }
-        },
-        WinInputMode::On => {
-            configure(WindowsInputBridgeAction::SetBridgeMode)?;
-            Ok(true)
-        }
-    }
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MouseTrackingMode {
-    None,
-    Default,
-    ButtonEvent,
-    AnyEvent,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone)]
-struct InnerInputState {
-    application_cursor_keys: bool,
-    mouse_default: bool,
-    mouse_button_event: bool,
-    mouse_any_event: bool,
-    mouse_tracking: MouseTrackingMode,
-    sgr_mouse: bool,
-    focus: bool,
-    bracketed_paste: bool,
-    win32_input: bool,
-}
-
-#[cfg(windows)]
-impl Default for InnerInputState {
-    fn default() -> Self {
-        Self {
-            application_cursor_keys: false,
-            mouse_default: false,
-            mouse_button_event: false,
-            mouse_any_event: false,
-            mouse_tracking: MouseTrackingMode::None,
-            sgr_mouse: false,
-            focus: false,
-            bracketed_paste: false,
-            win32_input: false,
-        }
-    }
-}
-
-#[cfg(windows)]
-impl InnerInputState {
-    fn set_mode(&mut self, mode: u16, enabled: bool) {
-        match mode {
-            1 => self.application_cursor_keys = enabled,
-            1000 => self.mouse_default = enabled,
-            1002 => self.mouse_button_event = enabled,
-            1003 => self.mouse_any_event = enabled,
-            1004 => self.focus = enabled,
-            1006 => self.sgr_mouse = enabled,
-            2004 => self.bracketed_paste = enabled,
-            9001 => self.win32_input = enabled,
-            _ => {}
-        }
-        self.mouse_tracking = if self.mouse_any_event {
-            MouseTrackingMode::AnyEvent
-        } else if self.mouse_button_event {
-            MouseTrackingMode::ButtonEvent
-        } else if self.mouse_default {
-            MouseTrackingMode::Default
-        } else {
-            MouseTrackingMode::None
-        };
-    }
-}
-
-#[cfg(windows)]
-struct InputModeTracker {
-    state: Arc<Mutex<InnerInputState>>,
-    pending: Vec<u8>,
-}
-
-#[cfg(windows)]
-impl InputModeTracker {
-    fn new(state: Arc<Mutex<InnerInputState>>) -> Self {
-        Self {
-            state,
-            pending: Vec::new(),
-        }
-    }
-
-    #[cfg(test)]
-    fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
-        self.filter_and_get_responses(bytes).0
-    }
-
-    fn filter_and_get_responses(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let mut data = std::mem::take(&mut self.pending);
-        data.extend_from_slice(bytes);
-        let mut output = Vec::with_capacity(data.len());
-        let mut responses = Vec::new();
-
-        let mut i = 0;
-        while i < data.len() {
-            if data[i] != 0x1b {
-                if let Some(string_end) = Self::terminated_c1_control_string_end(&data[i..]) {
-                    output.extend_from_slice(&data[i..i + string_end]);
-                    i += string_end;
-                    continue;
-                }
-                output.push(data[i]);
-                i += 1;
-                continue;
-            }
-
-            if i + 1 >= data.len() {
-                self.pending.extend_from_slice(&data[i..]);
-                break;
-            }
-
-            if let Some(string_end) = Self::terminated_control_string_end(&data[i..]) {
-                output.extend_from_slice(&data[i..i + string_end]);
-                i += string_end;
-                continue;
-            } else if Self::starts_control_string(data[i + 1]) {
-                self.pending.extend_from_slice(&data[i..]);
-                break;
-            }
-
-            if data[i + 1] != b'[' {
-                output.push(data[i]);
-                i += 1;
-                continue;
-            }
-
-            if i + 2 >= data.len() {
-                self.pending.extend_from_slice(&data[i..]);
-                break;
-            }
-
-            let mut end = i + 2;
-            let mut abort_at_esc = None;
-            while end < data.len() && !(0x40..=0x7e).contains(&data[end]) {
-                if data[end] == 0x1b {
-                    abort_at_esc = Some(end);
-                    break;
-                }
-                end += 1;
-            }
-
-            if let Some(esc) = abort_at_esc {
-                output.extend_from_slice(&data[i..esc]);
-                i = esc;
-                continue;
-            }
-
-            if end == data.len() {
-                self.pending.extend_from_slice(&data[i..]);
-                break;
-            }
-
-            let final_byte = data[end];
-            if data[i + 2] == b'?' && (final_byte == b'h' || final_byte == b'l') {
-                let enabled = final_byte == b'h';
-                match Self::split_dec_private_modes(&data[i + 3..end]) {
-                    Some((owned_modes, passthrough_modes)) if !owned_modes.is_empty() => {
-                        if let Ok(mut state) = self.state.lock() {
-                            for mode in owned_modes {
-                                state.set_mode(mode, enabled);
-                            }
-                        }
-                        if !passthrough_modes.is_empty() {
-                            output.extend_from_slice(b"\x1b[?");
-                            output.extend_from_slice(passthrough_modes.join(";").as_bytes());
-                            output.push(final_byte);
-                        }
-                    }
-                    _ => output.extend_from_slice(&data[i..=end]),
-                }
-            } else if let Some(response) =
-                Self::response_for_terminal_query(&data[i + 2..end], final_byte)
-            {
-                // Do not let the outer terminal answer DA/DSR/CPR queries. Those
-                // responses arrive as console input and race with user text.
-                responses.extend_from_slice(response);
-            } else {
-                output.extend_from_slice(&data[i..=end]);
-            }
-
-            i = end + 1;
-        }
-
-        (output, responses)
-    }
-
-    fn drain_pending(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.pending)
-    }
-
-    fn split_dec_private_modes(params: &[u8]) -> Option<(Vec<u16>, Vec<String>)> {
-        let params = std::str::from_utf8(params).ok()?;
-        let mut owned_modes = Vec::new();
-        let mut passthrough_modes = Vec::new();
-
-        for param in params.split(';') {
-            let mode = param.parse::<u16>().ok()?;
-            if Self::owns_dec_private_mode(mode) {
-                owned_modes.push(mode);
-            } else {
-                passthrough_modes.push(param.to_string());
-            }
-        }
-
-        Some((owned_modes, passthrough_modes))
-    }
-
-    fn owns_dec_private_mode(mode: u16) -> bool {
-        matches!(mode, 1 | 1000 | 1002 | 1003 | 1004 | 1006 | 2004 | 9001)
-    }
-
-    fn starts_control_string(second_byte: u8) -> bool {
-        matches!(second_byte, b']' | b'P' | b'_' | b'^' | b'X')
-    }
-
-    fn starts_c1_control_string(byte: u8) -> bool {
-        matches!(byte, 0x90 | 0x98 | 0x9d | 0x9e | 0x9f)
-    }
-
-    fn terminated_control_string_end(bytes: &[u8]) -> Option<usize> {
-        if bytes.len() < 2 || bytes[0] != 0x1b || !Self::starts_control_string(bytes[1]) {
-            return None;
-        }
-
-        let terminates_on_bel = bytes[1] == b']';
-        let mut index = 2;
-        while index < bytes.len() {
-            if terminates_on_bel && bytes[index] == 0x07 {
-                return Some(index + 1);
-            }
-            if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
-                return Some(index + 2);
-            }
-            index += 1;
-        }
-
-        None
-    }
-
-    fn terminated_c1_control_string_end(bytes: &[u8]) -> Option<usize> {
-        if bytes.is_empty() || !Self::starts_c1_control_string(bytes[0]) {
-            return None;
-        }
-
-        let terminates_on_bel = bytes[0] == 0x9d;
-        let mut index = 1;
-        while index < bytes.len() {
-            if terminates_on_bel && bytes[index] == 0x07 {
-                return Some(index + 1);
-            }
-            if bytes[index] == 0x9c {
-                return Some(index + 1);
-            }
-            if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
-                return Some(index + 2);
-            }
-            index += 1;
-        }
-
-        None
-    }
-
-    fn response_for_terminal_query(params: &[u8], final_byte: u8) -> Option<&'static [u8]> {
-        let params = std::str::from_utf8(params).unwrap_or("");
-        match final_byte {
-            b'c' if matches!(params, "" | "0") => Some(b"\x1b[?1;0c"),
-            b'c' if matches!(params, ">" | ">0") => Some(b"\x1b[>0;0;0c"),
-            b'n' if params == "5" => Some(b"\x1b[0n"),
-            b'n' if params == "6" => Some(b"\x1b[1;1R"),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(windows)]
-fn filter_child_output_for_outer_terminal(
-    tracker: &mut InputModeTracker,
-    data: &[u8],
-    child_input: &mut impl Write,
-) -> std::io::Result<Vec<u8>> {
-    let (filtered, responses) = tracker.filter_and_get_responses(data);
-    if !responses.is_empty() {
-        child_input.write_all(&responses)?;
-    }
-    Ok(filtered)
-}
-
-#[cfg(windows)]
-#[derive(Debug)]
-enum WinInputBatchMessage {
-    Stdin(Vec<u8>),
-    Resize,
-}
-
-#[cfg(all(test, windows))]
-impl PartialEq for WinInputBatchMessage {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Stdin(a), Self::Stdin(b)) => a == b,
-            (Self::Resize, Self::Resize) => true,
-            _ => false,
-        }
-    }
-}
-
-#[cfg(windows)]
-fn encode_win_input_batch(
-    parser: &mut termwiz::input::InputParser,
-    encoder: &mut WinInputEncoder,
-    records: &[winapi::um::wincon::INPUT_RECORD],
-    state: &InnerInputState,
-) -> Vec<WinInputBatchMessage> {
-    let mut messages = Vec::new();
-    let mut pending_input_records = Vec::new();
-
-    for record in records {
-        if record.EventType == winapi::um::wincon::WINDOW_BUFFER_SIZE_EVENT {
-            let data = encoder.encode_records(parser, &pending_input_records, state);
-            pending_input_records.clear();
-            if !data.is_empty() {
-                messages.push(WinInputBatchMessage::Stdin(data));
-            }
-            messages.push(WinInputBatchMessage::Resize);
-        } else {
-            pending_input_records.push(*record);
-        }
-    }
-
-    let data = encoder.encode_records(parser, &pending_input_records, state);
-    if !data.is_empty() {
-        messages.push(WinInputBatchMessage::Stdin(data));
-    }
-
-    messages
-}
-
-#[cfg(windows)]
-#[derive(Debug, Default)]
-struct WinInputEncoder {
-    last_mouse_buttons: u32,
-}
-
-#[cfg(windows)]
-impl WinInputEncoder {
-    fn encode_records(
-        &mut self,
-        parser: &mut termwiz::input::InputParser,
-        records: &[winapi::um::wincon::INPUT_RECORD],
-        state: &InnerInputState,
-    ) -> Vec<u8> {
-        use termwiz::input::{KeyCodeEncodeModes, KeyboardEncoding};
-        use winapi::um::wincon::*;
-
-        let mut output = Vec::new();
-        let modes = KeyCodeEncodeModes {
-            encoding: KeyboardEncoding::Xterm,
-            application_cursor_keys: state.application_cursor_keys,
-            newline_mode: false,
-            modify_other_keys: None,
-        };
-
-        let mut index = 0;
-        while index < records.len() {
-            let record = &records[index];
-            match record.EventType {
-                KEY_EVENT => {
-                    if state.win32_input {
-                        output.extend_from_slice(
-                            Self::encode_win32_key(unsafe { record.Event.KeyEvent() }).as_bytes(),
-                        );
-                    } else if let Some(text) =
-                        Self::encode_plain_text_key(unsafe { record.Event.KeyEvent() })
-                    {
-                        output.extend_from_slice(text.as_bytes());
-                    } else {
-                        for event in
-                            parser.decode_input_records_as_vec(std::slice::from_ref(record))
-                        {
-                            Self::append_decoded_event(&mut output, event, state, modes);
-                        }
-                    }
-                }
-                MOUSE_EVENT => {
-                    if let Some(mouse) =
-                        self.encode_mouse(unsafe { record.Event.MouseEvent() }, state)
-                    {
-                        output.extend_from_slice(&mouse);
-                    }
-                }
-                FOCUS_EVENT => {
-                    if state.focus {
-                        let focus = unsafe { record.Event.FocusEvent() };
-                        output.extend_from_slice(if focus.bSetFocus != 0 {
-                            b"\x1b[I"
-                        } else {
-                            b"\x1b[O"
-                        });
-                    }
-                }
-                _ => {}
-            }
-
-            index += 1;
-        }
-
-        output
-    }
-
-    fn encode_plain_text_key(key: &winapi::um::wincon::KEY_EVENT_RECORD) -> Option<String> {
-        if key.bKeyDown == 0 {
-            return None;
-        }
-
-        let unicode = *unsafe { key.uChar.UnicodeChar() };
-        if unicode == 0 {
-            return None;
-        }
-
-        let ch = std::char::from_u32(unicode as u32)?;
-        Some(ch.to_string().repeat(key.wRepeatCount as usize))
-    }
-
-    fn append_decoded_event(
-        output: &mut Vec<u8>,
-        event: termwiz::input::InputEvent,
-        state: &InnerInputState,
-        modes: termwiz::input::KeyCodeEncodeModes,
-    ) {
-        use termwiz::input::InputEvent;
-
-        match event {
-            InputEvent::Key(key) => {
-                if let Ok(encoded) = key.key.encode(key.modifiers, modes, true) {
-                    output.extend_from_slice(encoded.as_bytes());
-                }
-            }
-            InputEvent::Paste(paste) => {
-                if state.bracketed_paste {
-                    output.extend_from_slice(b"\x1b[200~");
-                    output.extend_from_slice(paste.as_bytes());
-                    output.extend_from_slice(b"\x1b[201~");
-                } else {
-                    output.extend_from_slice(paste.as_bytes());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn encode_win32_key(key: &winapi::um::wincon::KEY_EVENT_RECORD) -> String {
-        let key_down = if key.bKeyDown != 0 { 1 } else { 0 };
-        let unicode = *unsafe { key.uChar.UnicodeChar() } as u32;
-        format!(
-            "\x1b[{};{};{};{};{};{}_",
-            key.wVirtualKeyCode,
-            key.wVirtualScanCode,
-            unicode,
-            key_down,
-            key.dwControlKeyState,
-            key.wRepeatCount
-        )
-    }
-
-    fn encode_mouse(
-        &mut self,
-        mouse: &winapi::um::wincon::MOUSE_EVENT_RECORD,
-        state: &InnerInputState,
-    ) -> Option<Vec<u8>> {
-        use winapi::um::wincon::*;
-        const PHYSICAL_BUTTONS: u32 =
-            FROM_LEFT_1ST_BUTTON_PRESSED | FROM_LEFT_2ND_BUTTON_PRESSED | RIGHTMOST_BUTTON_PRESSED;
-
-        if state.mouse_tracking == MouseTrackingMode::None {
-            self.last_mouse_buttons = 0;
-            return None;
-        }
-
-        let is_move = (mouse.dwEventFlags & MOUSE_MOVED) != 0;
-        let is_wheel = (mouse.dwEventFlags & MOUSE_WHEELED) != 0;
-        let is_horizontal_wheel = (mouse.dwEventFlags & MOUSE_HWHEELED) != 0;
-        let physical_button_pressed = mouse.dwButtonState & PHYSICAL_BUTTONS != 0;
-        let button_event = physical_button_pressed
-            || self.last_mouse_buttons != 0
-            || is_wheel
-            || is_horizontal_wheel;
-
-        let should_send = match state.mouse_tracking {
-            MouseTrackingMode::None => false,
-            MouseTrackingMode::Default => !is_move && button_event,
-            MouseTrackingMode::ButtonEvent => (!is_move && button_event) || physical_button_pressed,
-            MouseTrackingMode::AnyEvent => is_move || button_event,
-        };
-
-        if !should_send {
-            self.last_mouse_buttons = mouse.dwButtonState & PHYSICAL_BUTTONS;
-            return None;
-        }
-
-        let mut code = if is_wheel {
-            let delta = ((mouse.dwButtonState >> 16) & 0xffff) as i16;
-            if delta > 0 {
-                64
-            } else {
-                65
-            }
-        } else if is_horizontal_wheel {
-            let delta = ((mouse.dwButtonState >> 16) & 0xffff) as i16;
-            if delta > 0 {
-                66
-            } else {
-                67
-            }
-        } else if is_move && !physical_button_pressed {
-            3
-        } else {
-            let buttons = if mouse.dwButtonState != 0 {
-                mouse.dwButtonState
-            } else {
-                self.last_mouse_buttons
-            };
-            if (buttons & FROM_LEFT_1ST_BUTTON_PRESSED) != 0 {
-                0
-            } else if (buttons & FROM_LEFT_2ND_BUTTON_PRESSED) != 0 {
-                1
-            } else if (buttons & RIGHTMOST_BUTTON_PRESSED) != 0 {
-                2
-            } else {
-                3
-            }
-        };
-
-        let mut modifier_code = 0;
-        if is_move {
-            modifier_code += 32;
-        }
-        if (mouse.dwControlKeyState & SHIFT_PRESSED) != 0 {
-            modifier_code += 4;
-        }
-        if (mouse.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0 {
-            modifier_code += 8;
-        }
-        if (mouse.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0 {
-            modifier_code += 16;
-        }
-        code += modifier_code;
-
-        let is_release = !is_move
-            && !is_wheel
-            && !is_horizontal_wheel
-            && mouse.dwButtonState == 0
-            && self.last_mouse_buttons != 0;
-        self.last_mouse_buttons = mouse.dwButtonState & PHYSICAL_BUTTONS;
-
-        if state.sgr_mouse {
-            Some(
-                format!(
-                    "\x1b[<{};{};{}{}",
-                    code,
-                    mouse.dwMousePosition.X + 1,
-                    mouse.dwMousePosition.Y + 1,
-                    if is_release { 'm' } else { 'M' }
-                )
-                .into_bytes(),
-            )
-        } else {
-            let code = if is_release { 3 + modifier_code } else { code };
-            let col = i32::from(mouse.dwMousePosition.X) + 1;
-            let row = i32::from(mouse.dwMousePosition.Y) + 1;
-            if !(1..=223).contains(&col) || !(1..=223).contains(&row) {
-                return None;
-            }
-            Some(vec![
-                0x1b,
-                b'[',
-                b'M',
-                (32 + code) as u8,
-                (32 + col) as u8,
-                (32 + row) as u8,
-            ])
-        }
-    }
-}
-
-#[cfg(all(test, windows))]
-mod windows_input_bridge_tests;
 
 #[derive(Debug, Parser, Clone)]
 pub struct RecordCommand {
@@ -1213,64 +347,10 @@ pub struct RecordCommand {
     #[arg(short)]
     outfile: Option<std::path::PathBuf>,
 
-    /// Windows input bridge mode for preserving Console input semantics
-    #[arg(long = "win-input", default_value = "auto")]
-    win_input: WinInputMode,
-
     /// Start prog instead of the default_prog defined by your
     /// wezterm configuration
     #[arg(value_parser)]
     prog: Vec<OsString>,
-}
-
-struct RecordLoopRuntimeIo<'a, W: Write> {
-    writer: &'a mut dyn Write,
-    master: &'a mut dyn portable_pty::MasterPty,
-    tty: &'a mut Tty,
-    cast_file: &'a mut W,
-    buffer: &'a mut Vec<u8>,
-    first_output: Instant,
-    #[cfg(windows)]
-    input_mode_tracker: &'a mut Option<InputModeTracker>,
-}
-
-impl<W: Write> RecordLoopIo for RecordLoopRuntimeIo<'_, W> {
-    fn write_stdin(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
-        self.writer.write_all(&data)?;
-        Ok(())
-    }
-
-    fn write_stdout(&mut self, mut data: Vec<u8>) -> anyhow::Result<()> {
-        let elapsed = self.first_output.elapsed().as_secs_f32();
-        #[cfg(windows)]
-        if let Some(tracker) = self.input_mode_tracker.as_mut() {
-            data = filter_child_output_for_outer_terminal(tracker, &data, &mut self.writer)?;
-        }
-        if data.is_empty() {
-            return Ok(());
-        }
-        self.tty.write_all(&data)?;
-        log_utf8_output(self.cast_file, self.buffer, elapsed, &mut data)?;
-        Ok(())
-    }
-
-    fn resize(&mut self, size: PtySize) -> anyhow::Result<()> {
-        self.master.resize(size)?;
-        Ok(())
-    }
-
-    fn drain_pending_stdout(&mut self) -> anyhow::Result<()> {
-        #[cfg(windows)]
-        if let Some(tracker) = self.input_mode_tracker.as_mut() {
-            let mut data = tracker.drain_pending();
-            if !data.is_empty() {
-                let elapsed = self.first_output.elapsed().as_secs_f32();
-                self.tty.write_all(&data)?;
-                log_utf8_output(self.cast_file, self.buffer, elapsed, &mut data)?;
-            }
-        }
-        Ok(())
-    }
 }
 
 impl RecordCommand {
@@ -1304,7 +384,7 @@ impl RecordCommand {
         writeln!(cast_file, "{}", serde_json::to_string(&header)?)?;
 
         let pty_system = native_pty_system();
-        let mut pair = pty_system.openpty(size)?;
+        let pair = pty_system.openpty(size)?;
 
         let cmd = config.build_prog(
             if self.prog.is_empty() {
@@ -1320,35 +400,7 @@ impl RecordCommand {
         drop(pair.slave);
         let mut child_output = pair.master.try_clone_reader()?;
 
-        #[cfg(windows)]
-        let use_win_input_bridge = configure_windows_input_bridge(
-            self.win_input,
-            |action| match action {
-                WindowsInputBridgeAction::SetRaw => tty.set_raw(),
-                WindowsInputBridgeAction::SetBridgeMode => tty.set_bridge_mode(),
-            },
-            |err| {
-                eprintln!(
-                    "warning: failed to initialize Windows input bridge: {err:#}; falling back to legacy input forwarding"
-                );
-            },
-        )?;
-        #[cfg(windows)]
-        if use_win_input_bridge {
-            let _ = tty.reset_outer_input_modes();
-        }
-
-        #[cfg(not(windows))]
         tty.set_raw()?;
-
-        #[cfg(windows)]
-        let inner_input_state = Arc::new(Mutex::new(InnerInputState::default()));
-        #[cfg(windows)]
-        let mut input_mode_tracker = if use_win_input_bridge {
-            Some(InputModeTracker::new(Arc::clone(&inner_input_state)))
-        } else {
-            None
-        };
 
         let (tx, rx) = channel();
 
@@ -1363,56 +415,10 @@ impl RecordCommand {
                     }
                     tx.send(Message::Stdout(buf[0..size].to_vec()))?;
                 }
-                tx.send(Message::StdoutEof)?;
                 Ok(())
             });
         }
 
-        #[cfg(windows)]
-        if use_win_input_bridge {
-            let mut input = tty.input_reader()?;
-            let tx = tx.clone();
-            let state = Arc::clone(&inner_input_state);
-            std::thread::spawn(move || -> anyhow::Result<()> {
-                let mut parser = termwiz::input::InputParser::new();
-                let mut encoder = WinInputEncoder::default();
-                loop {
-                    let records = input.read_console_input(128)?;
-                    let state = state.lock().map(|state| state.clone()).unwrap_or_default();
-                    for message in
-                        encode_win_input_batch(&mut parser, &mut encoder, &records, &state)
-                    {
-                        match message {
-                            WinInputBatchMessage::Stdin(data) => {
-                                tx.send(Message::Stdin(data))?;
-                            }
-                            WinInputBatchMessage::Resize => {
-                                tx.send(Message::Resize(input.get_size()?))?;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        #[cfg(windows)]
-        if !use_win_input_bridge {
-            let mut stdin = tty.reader()?;
-            let tx = tx.clone();
-            std::thread::spawn(move || -> anyhow::Result<()> {
-                let mut buf = [0u8; 8192];
-                loop {
-                    let size = stdin.read(&mut buf)?;
-                    if size == 0 {
-                        break;
-                    }
-                    tx.send(Message::Stdin(buf[0..size].to_vec()))?;
-                }
-                Ok(())
-            });
-        }
-
-        #[cfg(not(windows))]
         {
             let mut stdin = tty.reader()?;
             let tx = tx.clone();
@@ -1438,58 +444,54 @@ impl RecordCommand {
             });
         }
 
+        let mut child_status = None;
         let first_output = Instant::now();
         let mut buffer = vec![];
         let mut writer = pair.master.take_writer()?;
-        let mut loop_state = RecordLoopState::default();
-        let mut loop_io = RecordLoopRuntimeIo {
-            writer: writer.as_mut(),
-            master: pair.master.as_mut(),
-            tty: &mut tty,
-            cast_file: &mut cast_file,
-            buffer: &mut buffer,
-            first_output,
-            #[cfg(windows)]
-            input_mode_tracker: &mut input_mode_tracker,
-        };
 
-        loop {
-            let msg = if loop_state.child_status.is_some() && !loop_state.stdout_eof {
-                match rx.recv_timeout(
-                    stdout_drain_timeout_after_child_exit(
-                        true,
-                        loop_state.stdout_eof,
-                        loop_state.child_terminated_at,
-                        Instant::now(),
-                    )
-                    .unwrap_or_default(),
-                ) {
-                    Ok(msg) => msg,
-                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+        for msg in rx {
+            match msg {
+                Message::Stdin(data) => {
+                    writer.write_all(&data)?;
                 }
-            } else {
-                match rx.recv() {
-                    Ok(msg) => msg,
-                    Err(_) => break,
-                }
-            };
+                Message::Stdout(mut data) => {
+                    let elapsed = first_output.elapsed().as_secs_f32();
+                    tty.write_all(&data)?;
 
-            if process_record_message(&mut loop_state, &mut loop_io, msg, Instant::now())?
-                == RecordLoopControl::Break
-            {
-                break;
+                    // The end of the data may be an incomplete utf8 sequence
+                    // that straddles the buffer boundary.  JSON requires strings
+                    // to be utf-8 so we need to send the currently-valid portions
+                    // through to the .cast file and buffer up the remainder
+                    buffer.append(&mut data);
+                    match std::str::from_utf8(&buffer) {
+                        Ok(valid) => {
+                            Event::log_output(&mut cast_file, elapsed, valid)?;
+                            buffer.clear();
+                        }
+                        Err(error) => {
+                            let valid_len = error.valid_up_to();
+                            Event::log_output(&mut cast_file, elapsed, unsafe {
+                                std::str::from_utf8_unchecked(&buffer[0..valid_len])
+                            })?;
+
+                            buffer.drain(0..valid_len);
+
+                            if let Some(invalid_sequence_length) = error.error_len() {
+                                // Invalid sequence: skip it
+                                buffer.drain(0..invalid_sequence_length);
+                            }
+                        }
+                    }
+                }
+                Message::Terminated(status) => {
+                    child_status.replace(status);
+                    break;
+                }
             }
         }
 
-        loop_io.drain_pending_stdout()?;
-        drop(loop_io);
-
-        #[cfg(windows)]
-        if use_win_input_bridge {
-            let _ = tty.reset_outer_input_modes();
-        }
         tty.set_cooked()?;
-        eprintln!("Child status: {:?}", loop_state.child_status);
+        eprintln!("Child status: {:?}", child_status);
         cast_file.flush()?;
         eprintln!("*** Finished recording to {}", cast_file_name.display());
 
